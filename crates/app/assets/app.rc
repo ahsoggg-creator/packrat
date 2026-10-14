@@ -1,0 +1,24 @@
+1 ICON "icon.ico"
+1 24 "app.manifest"
+
+1 VERSIONINFO
+FILEVERSION PK_MAJOR,PK_MINOR,PK_PATCH,0
+PRODUCTVERSION PK_MAJOR,PK_MINOR,PK_PATCH,0
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "041904B0"
+    BEGIN
+      VALUE "CompanyName", "Packrat"
+      VALUE "FileDescription", "Packrat archive manager"
+      VALUE "ProductName", "Packrat"
+      VALUE "OriginalFilename", "Packrat.exe"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x419, 1200
+  END
+END
