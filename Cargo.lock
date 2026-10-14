@@ -330,6 +330,7 @@ name = "packrat-cli"
 version = "0.1.0"
 dependencies = [
  "packrat-core",
+ "tempfile",
 ]
 
 [[package]]
