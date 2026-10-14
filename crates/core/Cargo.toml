@@ -1,0 +1,9 @@
+[package]
+name = "packrat-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Packrat: archive formats, smart extraction, safety checks (no UI)"
+
+[dependencies]

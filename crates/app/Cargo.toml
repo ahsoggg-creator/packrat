@@ -1,0 +1,14 @@
+[package]
+name = "packrat-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Packrat archive manager (GUI, installer, updater)"
+
+[[bin]]
+name = "Packrat"
+path = "src/main.rs"
+
+[dependencies]
+packrat-core = { path = "../core" }

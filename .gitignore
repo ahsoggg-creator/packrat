@@ -1,0 +1,6 @@
+target/
+dist/
+# private keys must never be committed (the public certshsoggg.cer is fine)
+*.pfx
+*.p12
+*.snk
