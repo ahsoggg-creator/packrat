@@ -12,3 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 packrat-core = { path = "../core" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
