@@ -1,1 +1,27 @@
 //! Packrat core: archive formats, smart extraction and safety checks. No UI.
+
+pub mod archive;
+pub mod codec;
+pub mod create;
+pub mod encoding;
+pub mod entry;
+pub mod error;
+pub mod extract;
+pub mod input;
+pub mod open;
+pub mod par;
+pub mod progress;
+pub mod safepath;
+pub mod sevenz;
+pub mod smart;
+pub mod source;
+pub mod tar;
+#[doc(hidden)]
+pub mod testkit;
+pub mod timeutil;
+pub mod zip;
+
+pub use archive::{Archive, Kind};
+pub use entry::{Entry, EntryKind};
+pub use error::{Error, Result};
+pub use progress::Progress;

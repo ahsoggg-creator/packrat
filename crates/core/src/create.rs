@@ -1,0 +1,152 @@
+//! Creating archives: collect the inputs, pick the writer, never leave a half-written file behind.
+
+use crate::codec::stream::Compression;
+use crate::error::{Error, Result};
+use crate::input::{self, InputItem, Skipped};
+use crate::progress::Progress;
+use crate::sevenz::{self, SevenZOptions};
+use crate::tar;
+use crate::zip::{self, ZipMethod, ZipOptions};
+use std::fs::{self, File};
+use std::io::BufWriter;
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Format {
+    Zip(ZipMethod),
+    SevenZ,
+    /// TAR, optionally compressed: gz, zstd, xz or lz4.
+    Tar(Compression),
+}
+
+impl Format {
+    /// Extension to give the archive file, without the dot.
+    pub fn extension(self) -> &'static str {
+        match self {
+            Format::Zip(_) => "zip",
+            Format::SevenZ => "7z",
+            Format::Tar(Compression::None) => "tar",
+            Format::Tar(Compression::Gz) => "tar.gz",
+            Format::Tar(Compression::Zst) => "tar.zst",
+            Format::Tar(Compression::Xz) => "tar.xz",
+            Format::Tar(Compression::Lz4) => "tar.lz4",
+            Format::Tar(Compression::Bz2) => "tar.bz2",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Format> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "zip" => Format::Zip(ZipMethod::Deflate),
+            "zip-zstd" => Format::Zip(ZipMethod::Zstd),
+            "zip-store" => Format::Zip(ZipMethod::Store),
+            "7z" => Format::SevenZ,
+            "tar" => Format::Tar(Compression::None),
+            "tar.gz" | "tgz" => Format::Tar(Compression::Gz),
+            "tar.zst" | "tzst" => Format::Tar(Compression::Zst),
+            "tar.xz" | "txz" => Format::Tar(Compression::Xz),
+            "tar.lz4" => Format::Tar(Compression::Lz4),
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CreateOptions {
+    pub format: Format,
+    /// 1..=9 where the format has levels (deflate, 7z/LZMA2, xz).
+    pub level: u32,
+    /// 0 = all cores.
+    pub threads: usize,
+}
+
+impl CreateOptions {
+    pub fn new(format: Format) -> Self {
+        let level = if matches!(format, Format::SevenZ) { 5 } else { 6 };
+        Self {
+            format,
+            level,
+            threads: 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct CreateReport {
+    pub entries: usize,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub skipped: Skipped,
+}
+
+/// Packs `inputs` (files and folders) into `output`, which must not exist yet. The archive itself is left out
+/// if it lies inside one of the inputs.
+pub fn create_archive(
+    output: &Path,
+    inputs: &[PathBuf],
+    opts: &CreateOptions,
+    progress: &Progress,
+) -> Result<CreateReport> {
+    if output.exists() {
+        return Err(Error::Other(format!("'{}' already exists", output.display())));
+    }
+    let (mut items, skipped) = input::collect_inputs(inputs)?;
+    let out_abs = fs::canonicalize(
+        output
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    )
+    .ok()
+    .map(|d| d.join(output.file_name().unwrap_or_default()));
+    items.retain(|i: &InputItem| fs::canonicalize(&i.disk_path).ok() != out_abs);
+    if items.is_empty() {
+        return Err(Error::Other("nothing to add".into()));
+    }
+    let bytes_in = items.iter().map(|i| i.size).sum();
+
+    let result = write_to(output, &items, opts, progress);
+    match result {
+        Ok(()) => {
+            let bytes_out = fs::metadata(output)?.len();
+            Ok(CreateReport {
+                entries: items.len(),
+                bytes_in,
+                bytes_out,
+                skipped,
+            })
+        }
+        Err(e) => {
+            let _ = fs::remove_file(output);
+            Err(e)
+        }
+    }
+}
+
+fn write_to(output: &Path, items: &[InputItem], opts: &CreateOptions, progress: &Progress) -> Result<()> {
+    let file = File::options().write(true).create_new(true).open(output)?;
+    match opts.format {
+        Format::Zip(method) => {
+            let zopts = ZipOptions {
+                method,
+                level: opts.level,
+                threads: opts.threads,
+                ..Default::default()
+            };
+            zip::write_zip(BufWriter::with_capacity(256 << 10, file), items, &zopts, progress)?;
+        }
+        Format::SevenZ => {
+            let sopts = SevenZOptions {
+                level: opts.level,
+                threads: opts.threads,
+                ..Default::default()
+            };
+            sevenz::write_7z(file, items, &sopts, progress)?;
+        }
+        Format::Tar(c) => {
+            let w =
+                crate::codec::stream::writer(c, BufWriter::with_capacity(256 << 10, file), opts.level, opts.threads)?;
+            tar::write_tar(w, items, progress)?;
+        }
+    }
+    Ok(())
+}
