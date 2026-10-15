@@ -106,6 +106,10 @@ impl Archive for TarArchive {
         &self.entries
     }
 
+    fn skip_cost(&self, index: usize) -> u64 {
+        self.entries.iter().take(index).map(|e| e.size).sum()
+    }
+
     fn open_entry(&self, index: usize) -> Result<EntryReader<'_>> {
         let e = self
             .entries

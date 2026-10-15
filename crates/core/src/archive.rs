@@ -61,6 +61,11 @@ pub trait Archive: Send + Sync {
         0
     }
 
+    /// Bytes that must be decoded and thrown away to reach entry `index` (0 when it can be opened directly).
+    fn skip_cost(&self, _index: usize) -> u64 {
+        0
+    }
+
     fn random_access(&self) -> bool {
         self.kind().random_access()
     }

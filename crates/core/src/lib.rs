@@ -11,6 +11,7 @@ pub mod input;
 pub mod open;
 pub mod options;
 pub mod par;
+pub mod preview;
 pub mod progress;
 pub mod safepath;
 pub mod safety;
