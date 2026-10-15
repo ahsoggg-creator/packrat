@@ -13,6 +13,7 @@ pub mod options;
 pub mod par;
 pub mod progress;
 pub mod safepath;
+pub mod safety;
 pub mod sevenz;
 pub mod smart;
 pub mod source;

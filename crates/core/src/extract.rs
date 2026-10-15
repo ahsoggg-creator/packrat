@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 use crate::par::resolve_threads;
 use crate::progress::Progress;
 use crate::safepath::{self, Unsafe};
+use crate::safety::{self, Limits, Risk};
 use crate::smart::{self, Layout};
 use crate::timeutil;
 use rayon::prelude::*;
@@ -15,6 +16,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// What to do with a file that already exists at the destination.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -40,6 +42,13 @@ pub struct ExtractOptions {
     pub default_resolution: Resolution,
     pub resolutions: HashMap<usize, Resolution>,
     pub restore_times: bool,
+    /// Resource limits behind the warnings in `Plan::risks`.
+    pub limits: Limits,
+    /// Size of the archive file in bytes (0 when unknown); used for the expansion-ratio checks.
+    pub archive_len: u64,
+    /// The user saw `Plan::risks` and chose to continue. Without it `execute` refuses to run when there are
+    /// risks, and enforces the limits while unpacking.
+    pub accept_risks: bool,
 }
 
 impl ExtractOptions {
@@ -53,6 +62,9 @@ impl ExtractOptions {
             default_resolution: Resolution::Skip,
             resolutions: HashMap::new(),
             restore_times: true,
+            limits: Limits::default(),
+            archive_len: 0,
+            accept_risks: false,
         }
     }
 }
@@ -88,6 +100,8 @@ pub struct Plan {
     /// Files that already exist at their target.
     pub conflicts: Vec<Conflict>,
     pub total_bytes: u64,
+    /// Warnings that need the user's confirmation before extracting (see `safety`).
+    pub risks: Vec<Risk>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -100,6 +114,8 @@ pub struct ExtractReport {
     pub blocked: Vec<Issue>,
     pub failed: Vec<Issue>,
     pub cancelled: bool,
+    /// Extraction was stopped because a resource limit was reached while unpacking.
+    pub stopped: Option<String>,
 }
 
 pub fn plan(archive: &dyn Archive, opts: &ExtractOptions) -> Plan {
@@ -187,6 +203,14 @@ pub fn plan(archive: &dyn Archive, opts: &ExtractOptions) -> Plan {
         })
         .collect();
 
+    let risks = safety::inspect(
+        archive,
+        opts.selection.as_deref(),
+        &base,
+        &opts.limits,
+        opts.archive_len,
+    );
+
     Plan {
         base,
         layout,
@@ -194,6 +218,53 @@ pub fn plan(archive: &dyn Archive, opts: &ExtractOptions) -> Plan {
         blocked,
         conflicts,
         total_bytes,
+        risks,
+    }
+}
+
+/// Enforces the resource limits while data is unpacked (only when the user has not accepted the risks).
+struct Guard {
+    stop: AtomicBool,
+    total: AtomicU64,
+    cap: Option<u64>,
+    /// (archive length, max ratio, minimum size): for streams whose unpacked size is not known in advance.
+    ratio: Option<(u64, f64, u64)>,
+}
+
+impl Guard {
+    fn new(opts: &ExtractOptions) -> Self {
+        let enforce = !opts.accept_risks;
+        Guard {
+            stop: AtomicBool::new(false),
+            total: AtomicU64::new(0),
+            cap: enforce.then_some(opts.limits.max_total_bytes),
+            ratio: (enforce && opts.archive_len > 0).then_some((
+                opts.archive_len,
+                opts.limits.max_total_ratio,
+                opts.limits.total_ratio_min_size,
+            )),
+        }
+    }
+
+    fn add(&self, n: u64) -> Result<()> {
+        if self.stop.load(Ordering::Relaxed) {
+            return Err(Error::Blocked("extraction was stopped by a resource limit".into()));
+        }
+        let total = self.total.fetch_add(n, Ordering::Relaxed) + n;
+        let hit = match (self.cap, self.ratio) {
+            (Some(cap), _) if total > cap => Some(format!("the unpacked size passed the limit of {cap} bytes")),
+            (_, Some((len, max, min))) if total >= min && total as f64 / len as f64 > max => {
+                Some(format!("the data expands more than {max:.0}x (archive bomb?)"))
+            }
+            _ => None,
+        };
+        match hit {
+            Some(msg) => {
+                self.stop.store(true, Ordering::Relaxed);
+                Err(Error::Blocked(msg))
+            }
+            None => Ok(()),
+        }
     }
 }
 
@@ -221,6 +292,7 @@ enum Outcome {
     KeptBoth(String, String),
     Failed(String, String),
     Cancelled,
+    Stopped(String),
 }
 
 fn write_file(
@@ -230,6 +302,7 @@ fn write_file(
     reader: &mut dyn Read,
     opts: &ExtractOptions,
     progress: &Progress,
+    guard: &Guard,
 ) -> Outcome {
     let name = entry.path.clone();
     let fail = |m: String| Outcome::Failed(name.clone(), m);
@@ -283,6 +356,7 @@ fn write_file(
             if n == 0 {
                 break;
             }
+            guard.add(n as u64)?;
             file.write_all(&buf[..n])?;
             written += n as u64;
             progress.add_bytes(n as u64);
@@ -308,6 +382,7 @@ fn write_file(
             let _ = fs::remove_file(&target);
             match Error::from(e) {
                 Error::Cancelled => Outcome::Cancelled,
+                Error::Blocked(m) => Outcome::Stopped(m),
                 other => fail(other.to_string()),
             }
         }
@@ -322,6 +397,11 @@ pub fn execute(
     opts: &ExtractOptions,
     progress: &Progress,
 ) -> Result<ExtractReport> {
+    if !plan.risks.is_empty() && !opts.accept_risks {
+        let list: Vec<String> = plan.risks.iter().map(Risk::describe).collect();
+        return Err(Error::Blocked(format!("confirmation is required: {}", list.join("; "))));
+    }
+    let guard = Guard::new(opts);
     fs::create_dir_all(&plan.base)?;
     let mut report = ExtractReport {
         blocked: plan.blocked.clone(),
@@ -363,7 +443,7 @@ pub fn execute(
                     }
                     let entry = &entries[item.index];
                     match archive.open_entry(item.index) {
-                        Ok(mut r) => write_file(&plan.base, item, entry, &mut r, opts, progress),
+                        Ok(mut r) => write_file(&plan.base, item, entry, &mut r, opts, progress, &guard),
                         Err(e) => Outcome::Failed(entry.path.clone(), e.to_string()),
                     }
                 })
@@ -374,8 +454,8 @@ pub fn execute(
         let stop = std::cell::Cell::new(false);
         let walked = archive.walk(&mut |e| by_index.contains_key(&e.index) && !stop.get(), &mut |e, r| {
             let item = by_index[&e.index];
-            let o = write_file(&plan.base, item, e, r, opts, progress);
-            if matches!(o, Outcome::Cancelled) {
+            let o = write_file(&plan.base, item, e, r, opts, progress, &guard);
+            if matches!(o, Outcome::Cancelled | Outcome::Stopped(_)) {
                 stop.set(true);
                 outcomes.push(o);
                 return Err(Error::Cancelled);
@@ -405,6 +485,7 @@ pub fn execute(
             Outcome::Skipped(p) => report.skipped_existing.push(p),
             Outcome::Failed(path, message) => report.failed.push(Issue { path, message }),
             Outcome::Cancelled => report.cancelled = true,
+            Outcome::Stopped(m) => report.stopped = Some(m),
         }
     }
     if progress.is_cancelled() {

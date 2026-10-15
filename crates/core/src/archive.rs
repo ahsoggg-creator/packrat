@@ -56,6 +56,11 @@ pub trait Archive: Send + Sync {
         None
     }
 
+    /// Entries whose stored data overlaps another entry (ZIP only).
+    fn overlapping_entries(&self) -> usize {
+        0
+    }
+
     fn random_access(&self) -> bool {
         self.kind().random_access()
     }
