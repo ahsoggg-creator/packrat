@@ -4,19 +4,21 @@
 
 An archive manager for Windows (a replacement for 7-Zip + Bandizip + PeaZip): compression and extraction on all
 cores, "smart" extraction without nested `Folder\Folder`, protection against hostile archives, correct names in old
-ZIP files, passwords, and a preview of files right inside the archive. Written in Rust, with no native C compression
-libraries.
+ZIP files, passwords, and a preview of files right inside the archive. Written in Rust; the only native code is the RAR
+decoder (unrar, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
 
 ![Archive window: tree, sizes, compression ratio and a code preview](docs/screenshots/02-archive-code.png)
 
 *All screenshots were taken with made-up data (`Packrat.exe --demo`) — no real file names appear on them.*
 
-## Features (version 0.3.0)
+## Features (version 0.4.0)
 
 - **Formats.** Read and write: ZIP (store, deflate, zstd) and TAR (including `.tar.gz`, `.tar.zst`, `.tar.xz`,
   `.tar.lz4`). Read: 7z (LZMA2, BZip2 and PPMd verified on 7-Zip archives, other methods through the library), single
-  `.gz`, `.bz2`, `.xz`, `.zst`, `.lz4` files. Creating 7z (LZMA2) works too. RAR is not supported: the unrar decoder's
-  license forbids bundling it.
+  `.gz`, `.bz2`, `.xz`, `.zst`, `.lz4` files. Creating 7z (LZMA2) works too. Read only: **RAR** (all versions up to 5.x, passwords, volumes open from any
+  part; through the unrar library), **CAB** (MSZIP, LZX, Quantum; single cabinet), **ISO 9660** (Joliet and Rock
+  Ridge), **LZH/LHA**, **AR/DEB**, **CPIO** (including `.cpio.gz` and the like) and **RPM**. `.jar`, `.apk`, `.docx`,
+  `.epub`, `.cbz` and similar files are ZIP and open the same way.
 - **All cores.** ZIP entries and blocks of large files are compressed in parallel (deflate in independent blocks
   like pigz, zstd and lz4 in independent frames, 7z in parallel LZMA2 blocks, xz in its own blocks). Independent ZIP
   entries are extracted in parallel. The thread count is configurable (`--threads N`, Settings). Measured speed-ups:
@@ -121,7 +123,7 @@ Packrat.exe --screenshots docs\screenshots
 
 ## Limitations
 
-- RAR is not supported (license). ZIP methods deflate64, bzip2 and LZMA cannot be read.
+- RAR is read only (the unrar license does not allow creating it); a RAR inside another archive has to be extracted first. Multi-file CAB sets, ISO files over 4 GiB, UDF images and the legacy `.Z` and `.lzma` are not supported. ZIP methods deflate64, bzip2 and LZMA cannot be read.
 - Encoding detection is statistical and was verified on generated names (Russian in CP866 and CP1251, Japanese,
   Chinese, Korean); on short or mixed names it can be wrong — then choose the encoding by hand. ZIP only: names in
   TAR and 7z are read as UTF-8.

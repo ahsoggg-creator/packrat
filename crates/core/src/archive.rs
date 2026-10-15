@@ -17,6 +17,13 @@ pub enum Kind {
     Xz,
     Zst,
     Lz4,
+    Rar,
+    Cab,
+    Lzh,
+    Ar,
+    Cpio,
+    Rpm,
+    Iso,
 }
 
 impl Kind {
@@ -35,13 +42,20 @@ impl Kind {
             Kind::Xz => "XZ",
             Kind::Zst => "ZST",
             Kind::Lz4 => "LZ4",
+            Kind::Rar => "RAR",
+            Kind::Cab => "CAB",
+            Kind::Lzh => "LZH",
+            Kind::Ar => "AR",
+            Kind::Cpio => "CPIO",
+            Kind::Rpm => "RPM",
+            Kind::Iso => "ISO",
         }
     }
 
     /// True when entries can be opened independently (central directory), so extraction can use many
     /// threads and a preview does not have to read what comes before the entry.
     pub fn random_access(self) -> bool {
-        matches!(self, Kind::Zip)
+        matches!(self, Kind::Zip | Kind::Ar | Kind::Cpio | Kind::Iso)
     }
 }
 
@@ -94,4 +108,32 @@ pub trait Archive: Send + Sync {
         }
         Ok(())
     }
+}
+
+/// Largest entry that `open_via_walk` will hold in memory.
+const MAX_BUFFERED_ENTRY: u64 = 512 << 20;
+
+/// `open_entry` for formats that can only be read front to back: one `walk` that keeps the wanted entry.
+pub(crate) fn open_via_walk(a: &dyn Archive, index: usize) -> Result<EntryReader<'static>> {
+    let e = a
+        .entries()
+        .get(index)
+        .ok_or_else(|| crate::error::Error::Other(format!("no entry #{index}")))?;
+    if e.size > MAX_BUFFERED_ENTRY {
+        return Err(crate::error::Error::Unsupported(format!(
+            "'{}' is too large to open from a streaming archive",
+            e.path
+        )));
+    }
+    let mut data = Vec::with_capacity(e.size as usize);
+    let mut found = false;
+    a.walk(&mut |x| x.index == index, &mut |_, r| {
+        r.read_to_end(&mut data)?;
+        found = true;
+        Ok(())
+    })?;
+    if !found {
+        return Err(crate::error::Error::Corrupt("entry disappeared from the archive".into()));
+    }
+    Ok(Box::new(std::io::Cursor::new(data)))
 }
