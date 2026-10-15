@@ -61,15 +61,18 @@ mod imp {
         }
     }
 
-    /// Writes to the parent console of a GUI-subsystem process (a no-op without one).
+    /// Prints to stdout when it is redirected; otherwise to the parent console of a GUI-subsystem process
+    /// (a no-op when there is neither).
     pub fn console_print(text: &str) {
         use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+        let mut out = std::io::stdout();
+        if out.write_all(text.as_bytes()).and_then(|()| out.flush()).is_ok() {
+            return;
+        }
         // SAFETY: AttachConsole has no memory-safety preconditions.
-        let attached = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.is_ok();
+        let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
         if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
             let _ = f.write_all(text.as_bytes());
-        } else if !attached {
-            eprint!("{text}");
         }
     }
 

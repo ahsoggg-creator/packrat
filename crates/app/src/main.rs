@@ -104,14 +104,11 @@ fn run_install(exe: &std::path::Path, silent: bool) -> ExitCode {
     match installer::install(&env, exe) {
         Ok(installed) => {
             diag::info("installed");
-            if silent
-                || winint::message_box(
+            // a silent install (scripts, CI) must not start the program
+            if !silent
+                && winint::message_box(
                     t(Key::AppTitle),
-                    &format!(
-                        "{}\n\n{}",
-                        tf(Key::Installed, &[&installed.display().to_string()]),
-                        t(Key::ContextMenuHint)
-                    ),
+                    &tf(Key::Installed, &[&installed.display().to_string()]),
                     true,
                 )
             {

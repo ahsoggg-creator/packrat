@@ -12,6 +12,7 @@ USAGE:
   packrat-cli extract <archive> [NAMES...] [-o DIR] [--smart] [--threads N]
                       [--skip | --overwrite | --keep-both]
   packrat-cli create <output> <paths...> [--format FMT] [--level N] [--threads N]
+  packrat-cli bench-gen <dir> [--mb N]     write the deterministic data set used by scripts/bench.ps1
   packrat-cli --version | --help
 
 FORMATS (create): zip (deflate), zip-zstd, zip-store, 7z, tar, tar.gz, tar.zst, tar.xz, tar.lz4
@@ -94,6 +95,7 @@ fn main() -> ExitCode {
         "list" | "l" => cmd_list(args),
         "extract" | "x" => cmd_extract(args),
         "create" | "c" | "a" => cmd_create(args),
+        "bench-gen" => cmd_bench_gen(args),
         other => Err(format!("unknown command '{other}' (see --help)")),
     };
     match result {
@@ -259,4 +261,104 @@ fn cmd_create(mut args: Args) -> Result<u8, String> {
         eprintln!("skipped {}: {why}", p.display());
     }
     Ok(u8::from(!report.skipped.is_empty()))
+}
+
+/// Deterministic benchmark data: many small text files, medium structured binaries and large incompressible files.
+fn cmd_bench_gen(mut args: Args) -> Result<u8, String> {
+    use std::io::Write;
+    let mb = args.number(&["--mb"])?.unwrap_or(600) as u64;
+    let dir = PathBuf::from(args.0.first().cloned().ok_or("bench-gen: target folder is missing")?);
+    if dir.exists() && std::fs::read_dir(&dir).map_err(|e| e.to_string())?.next().is_some() {
+        return Err(format!("{} is not empty", dir.display()));
+    }
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    const WORDS: [&str; 32] = [
+        "fn", "let", "mut", "impl", "struct", "return", "match", "self", "pub", "use", "async", "await", "Vec",
+        "String", "Option", "Result", "value", "index", "buffer", "stream", "archive", "entry", "thread", "block",
+        "name", "size", "path", "frame", "offset", "header", "crc", "limit",
+    ];
+    let mk = |sub: &str| -> Result<PathBuf, String> {
+        let d = dir.join(sub);
+        std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+        Ok(d)
+    };
+    let total = mb * 1024 * 1024;
+    let (text_bytes, bin_bytes, noise_bytes) = (total * 40 / 100, total * 35 / 100, total * 25 / 100);
+
+    let src = mk("src")?;
+    let mut written = 0u64;
+    let mut i = 0;
+    while written < text_bytes {
+        let size = 2_000 + next() % 38_000;
+        let mut body = String::with_capacity(size as usize + 64);
+        while (body.len() as u64) < size {
+            for _ in 0..(3 + next() % 8) {
+                body.push_str(WORDS[(next() % 32) as usize]);
+                body.push(if next() % 5 == 0 { '_' } else { ' ' });
+            }
+            body.push_str(&format!(
+                "{};
+",
+                next() % 10_000
+            ));
+        }
+        let sub = src.join(format!("mod{:02}", i % 40));
+        std::fs::create_dir_all(&sub).map_err(|e| e.to_string())?;
+        std::fs::write(sub.join(format!("file{i:05}.rs")), &body).map_err(|e| e.to_string())?;
+        written += body.len() as u64;
+        i += 1;
+    }
+
+    let data = mk("data")?;
+    let mut written = 0u64;
+    let mut i = 0;
+    while written < bin_bytes {
+        let size = 2 * 1024 * 1024 + next() % (8 * 1024 * 1024);
+        let mut f = std::fs::File::create(data.join(format!("table{i:03}.bin"))).map_err(|e| e.to_string())?;
+        let mut left = size;
+        while left > 0 {
+            // records: a counter, small numbers and some noise
+            let mut rec = Vec::with_capacity(64 * 1024);
+            while rec.len() < 64 * 1024 {
+                rec.extend((written + rec.len() as u64).to_le_bytes());
+                rec.extend((next() % 1000).to_le_bytes());
+                rec.extend(next().to_le_bytes());
+                rec.extend([0u8; 16]);
+            }
+            let n = (rec.len() as u64).min(left) as usize;
+            f.write_all(&rec[..n]).map_err(|e| e.to_string())?;
+            left -= n as u64;
+        }
+        written += size;
+        i += 1;
+    }
+
+    let media = mk("media")?;
+    let mut written = 0u64;
+    let mut i = 0;
+    while written < noise_bytes {
+        let size = (noise_bytes / 4).max(1 << 20);
+        let mut f = std::fs::File::create(media.join(format!("clip{i}.bin"))).map_err(|e| e.to_string())?;
+        let mut left = size;
+        while left > 0 {
+            let n = (1u64 << 20).min(left) as usize;
+            let mut buf = vec![0u8; n];
+            for b in buf.chunks_mut(8) {
+                let v = next().to_le_bytes();
+                b.copy_from_slice(&v[..b.len()]);
+            }
+            f.write_all(&buf).map_err(|e| e.to_string())?;
+            left -= n as u64;
+        }
+        written += size;
+        i += 1;
+    }
+    println!("wrote {} to {}", human(written + text_bytes + bin_bytes), dir.display());
+    Ok(0)
 }
