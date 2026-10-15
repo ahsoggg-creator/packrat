@@ -198,7 +198,8 @@ mod tests {
         assert_eq!(installed, env.installed_exe());
         assert_eq!(fs::read(&installed).unwrap(), b"MZ fake");
         let target = winint::read_shortcut_target(&env.shortcut()).expect("shortcut readable");
-        assert_eq!(PathBuf::from(target), installed);
+        // the shell may report the 8.3 short form of the temp folder: compare real paths
+        assert_eq!(fs::canonicalize(target).unwrap(), fs::canonicalize(&installed).unwrap());
         assert!(registry_has(&env));
 
         // installing again over an existing copy works (upgrade)
