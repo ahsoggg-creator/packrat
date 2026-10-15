@@ -418,6 +418,33 @@ impl Archive for ZipArchive {
         self.legacy.as_ref()
     }
 
+    fn overlapping_entries(&self) -> usize {
+        // each entry occupies [local header start, end of its data); two entries must not share bytes
+        let mut ranges: Vec<(u64, u64)> = self
+            .meta
+            .iter()
+            .zip(&self.entries)
+            .map(|(m, e)| {
+                (
+                    m.local_offset,
+                    m.local_offset
+                        .saturating_add(30 + e.raw_name.len() as u64)
+                        .saturating_add(m.csize),
+                )
+            })
+            .collect();
+        ranges.sort_unstable();
+        let mut overlaps = 0;
+        let mut reach = 0u64;
+        for (start, end) in ranges {
+            if start < reach {
+                overlaps += 1;
+            }
+            reach = reach.max(end);
+        }
+        overlaps
+    }
+
     fn entries(&self) -> &[Entry] {
         &self.entries
     }

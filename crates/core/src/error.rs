@@ -52,6 +52,9 @@ impl From<io::Error> for Error {
             if let Some(Error::Integrity(m)) = inner.downcast_ref::<Error>() {
                 return Error::Integrity(m.clone());
             }
+            if let Some(Error::Blocked(m)) = inner.downcast_ref::<Error>() {
+                return Error::Blocked(m.clone());
+            }
         }
         Error::Io(e)
     }

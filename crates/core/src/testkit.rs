@@ -14,6 +14,8 @@ pub struct RawEntry {
     pub deflate: bool,
     /// MS-DOS `(date, time)` for the entry; a fixed date when unset.
     pub dos: Option<(u16, u16)>,
+    /// Make the central directory point at the data of this earlier entry (overlapping entries).
+    pub share_data_with: Option<usize>,
 }
 
 impl RawEntry {
@@ -26,6 +28,7 @@ impl RawEntry {
             extra: Vec::new(),
             deflate: false,
             dos: None,
+            share_data_with: None,
         }
     }
 
@@ -42,11 +45,17 @@ impl RawEntry {
             extra: Vec::new(),
             deflate: false,
             dos: None,
+            share_data_with: None,
         }
     }
 
     pub fn utf8(mut self) -> Self {
         self.flags |= 0x0800;
+        self
+    }
+
+    pub fn sharing_data_with(mut self, earlier: usize) -> Self {
+        self.share_data_with = Some(earlier);
         self
     }
 
@@ -70,8 +79,10 @@ impl RawEntry {
 pub fn raw_zip(entries: &[RawEntry]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut central = Vec::new();
+    let mut offsets: Vec<u32> = Vec::new();
     for e in entries {
         let offset = out.len() as u32;
+        offsets.push(offset);
         let crc = crc32fast::hash(&e.data);
         let (method, body): (u16, Vec<u8>) = if e.deflate && !e.data.is_empty() {
             (8, crate::codec::deflate::compress_block(&e.data, 6, true))
@@ -111,7 +122,7 @@ pub fn raw_zip(entries: &[RawEntry]) -> Vec<u8> {
         central.extend(0u16.to_le_bytes());
         central.extend(0u16.to_le_bytes());
         central.extend(e.unix_mode.map_or(0, |m| m << 16).to_le_bytes());
-        central.extend(offset.to_le_bytes());
+        central.extend(e.share_data_with.map_or(offset, |i| offsets[i]).to_le_bytes());
         central.extend(&e.name);
         central.extend(&e.extra);
     }
