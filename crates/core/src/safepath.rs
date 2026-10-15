@@ -122,16 +122,30 @@ fn is_redirect(meta: &fs::Metadata) -> bool {
 
 /// Creates the directories `rel[..]` below `root`, refusing to pass through a symbolic link or junction
 /// or through a file. `root` itself is trusted (the user chose it).
-pub fn ensure_dirs(root: &Path, rel: &[String]) -> Result<PathBuf, String> {
+/// Why a folder could not be prepared.
+#[derive(Debug, Clone)]
+pub struct DirError {
+    pub message: String,
+    /// The operating system said "access denied": a retry with more rights might work.
+    pub denied: bool,
+}
+
+impl From<String> for DirError {
+    fn from(message: String) -> Self {
+        DirError { message, denied: false }
+    }
+}
+
+pub fn ensure_dirs(root: &Path, rel: &[String]) -> Result<PathBuf, DirError> {
     let mut cur = root.to_path_buf();
     for part in rel {
         cur.push(part);
         match fs::symlink_metadata(&cur) {
             Ok(m) if is_redirect(&m) => {
-                return Err(format!("'{}' is a link; refusing to write through it", cur.display()));
+                return Err(format!("'{}' is a link; refusing to write through it", cur.display()).into());
             }
             Ok(m) if m.is_dir() => {}
-            Ok(_) => return Err(format!("'{}' exists and is not a folder", cur.display())),
+            Ok(_) => return Err(format!("'{}' exists and is not a folder", cur.display()).into()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => match fs::create_dir(&cur) {
                 Ok(()) => {}
                 // another thread may have created it just now
@@ -140,12 +154,17 @@ pub fn ensure_dirs(root: &Path, rel: &[String]) -> Result<PathBuf, String> {
                         .map(|m| is_redirect(&m) || !m.is_dir())
                         .unwrap_or(true)
                     {
-                        return Err(format!("'{}' is not a plain folder", cur.display()));
+                        return Err(format!("'{}' is not a plain folder", cur.display()).into());
                     }
                 }
-                Err(e) => return Err(format!("cannot create '{}': {e}", cur.display())),
+                Err(e) => {
+                    return Err(DirError {
+                        message: format!("cannot create '{}': {e}", cur.display()),
+                        denied: e.kind() == std::io::ErrorKind::PermissionDenied,
+                    });
+                }
             },
-            Err(e) => return Err(format!("cannot inspect '{}': {e}", cur.display())),
+            Err(e) => return Err(format!("cannot inspect '{}': {e}", cur.display()).into()),
         }
     }
     Ok(cur)

@@ -343,3 +343,36 @@ fn existing_junctions_are_not_written_through() {
     assert_eq!(report.failed.len(), 1, "{report:?}");
     assert_eq!(fs::read_to_string(dest.join("fine.txt")).unwrap(), "ok");
 }
+
+/// A destination that refuses writes is reported as "access denied" so the caller can offer to retry with more
+/// rights. The refusal is a real ACL entry (deny write for Everyone), set and removed with icacls.
+#[cfg(windows)]
+#[test]
+fn a_write_protected_destination_is_reported_as_needing_admin() {
+    use std::process::Command;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("locked");
+    fs::create_dir(&dest).unwrap();
+    let icacls = |args: &[&str]| {
+        Command::new("icacls")
+            .arg(&dest)
+            .args(args)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    if !icacls(&["/deny", "*S-1-1-0:(OI)(CI)(WD,AD)"]) {
+        eprintln!("icacls is not usable here: skipped");
+        return;
+    }
+    let zip = raw_zip(&[RawEntry::file("a.txt", "x"), RawEntry::file("sub/b.txt", "y")]);
+    let a = open_source(Arc::new(MemSource(zip)), "p.zip").unwrap();
+    let mut opts = ExtractOptions::new(&dest, "p.zip");
+    opts.smart = false;
+    let report = extract(&*a, &opts, &Progress::new()).unwrap();
+    let removed = icacls(&["/remove:d", "*S-1-1-0"]);
+    assert!(removed, "the test must not leave a locked folder behind");
+    assert!(report.needs_admin, "{report:?}");
+    assert_eq!(report.files, 0);
+    assert!(!report.failed.is_empty());
+}

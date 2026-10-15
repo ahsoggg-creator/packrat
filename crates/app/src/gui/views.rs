@@ -177,6 +177,16 @@ impl App {
                             self.loaded = None;
                             self.preview.clear();
                         }
+                        if has && ui.button(t(Key::VerifyArchive)).clicked() {
+                            self.start_verify(&ctx);
+                        }
+                        let zip_with_path = self
+                            .loaded
+                            .as_ref()
+                            .is_some_and(|l| l.archive.kind() == packrat_core::Kind::Zip && l.path.is_some());
+                        if zip_with_path && ui.button(t(Key::RepairButton)).clicked() {
+                            self.repair_current(&ctx);
+                        }
                         let legacy = self
                             .loaded
                             .as_ref()
@@ -245,6 +255,12 @@ impl App {
                                 "· {}",
                                 tf(Key::StatusSelected, &[&l.selected.len().to_string()])
                             )));
+                        }
+                        if l.archive.is_recovered() {
+                            ui.label(
+                                RichText::new(tf(Key::RecoveredBanner, &[&l.archive.entries().len().to_string()]))
+                                    .color(p.warn),
+                            );
                         }
                         if l.uses_zipcrypto() {
                             ui.label(RichText::new(t(Key::WeakEncryption)).color(p.warn))

@@ -92,6 +92,33 @@ mod imp {
     pub fn show_in_explorer(path: &Path) {
         let _ = std::process::Command::new("explorer.exe").arg(path).spawn();
     }
+
+    /// Runs `exe` with the "runas" verb: Windows shows the UAC prompt.
+    pub fn run_elevated(exe: &Path, args: &str) -> Result<(), String> {
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let (verb, file, params) = (wide("runas"), wide(&exe.to_string_lossy()), wide(args));
+        // SAFETY: all strings are NUL-terminated and live for the call.
+        let h = unsafe {
+            ShellExecuteW(
+                None,
+                PCWSTR(verb.as_ptr()),
+                PCWSTR(file.as_ptr()),
+                PCWSTR(params.as_ptr()),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        // values above 32 mean success
+        if h.0 as usize > 32 {
+            Ok(())
+        } else {
+            Err(format!(
+                "the elevated window could not be started (code {})",
+                h.0 as usize
+            ))
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -117,6 +144,10 @@ mod imp {
     }
 
     pub fn show_in_explorer(_: &Path) {}
+
+    pub fn run_elevated(_: &Path, _: &str) -> Result<(), String> {
+        Err("elevation needs Windows".into())
+    }
 }
 
 pub fn create_shortcut(lnk: &Path, target: &Path, args: &str, description: &str) -> Result<(), String> {
@@ -134,6 +165,11 @@ pub fn console_print(text: &str) {
 
 pub fn show_in_explorer(path: &Path) {
     imp::show_in_explorer(path)
+}
+
+/// Starts a program with administrator rights (one UAC prompt).
+pub fn run_elevated(exe: &Path, args: &str) -> Result<(), String> {
+    imp::run_elevated(exe, args)
 }
 
 /// Native message box; returns false only when a Yes/No box was answered "No".

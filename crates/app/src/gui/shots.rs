@@ -146,7 +146,7 @@ fn setup(app: &mut App, ctx: &egui::Context, step: usize) {
                     "⛔ CON — reserved Windows device name 'CON'".into(),
                 ],
                 folder: None,
-                wrong_password: false,
+                ..Default::default()
             });
         }
         _ => {}

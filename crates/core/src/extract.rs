@@ -119,6 +119,8 @@ pub struct ExtractReport {
     pub cancelled: bool,
     /// Extraction was stopped because a resource limit was reached while unpacking.
     pub stopped: Option<String>,
+    /// Some entries failed only because access was denied: running again as administrator may help.
+    pub needs_admin: bool,
 }
 
 pub fn plan(archive: &dyn Archive, opts: &ExtractOptions) -> Plan {
@@ -290,12 +292,16 @@ fn unique_name(target: &Path) -> PathBuf {
 }
 
 enum Outcome {
-    Written { bytes: u64 },
+    Written {
+        bytes: u64,
+    },
     Skipped(String),
     KeptBoth(String, String),
     Failed(String, String),
     Cancelled,
     Stopped(String),
+    /// Failed because the system refused access.
+    Denied(String, String),
 }
 
 fn write_file(
@@ -311,7 +317,8 @@ fn write_file(
     let fail = |m: String| Outcome::Failed(name.clone(), m);
     let parent = match safepath::ensure_dirs(base, &item.rel[..item.rel.len() - 1]) {
         Ok(p) => p,
-        Err(m) => return fail(m),
+        Err(e) if e.denied => return Outcome::Denied(name, e.message),
+        Err(e) => return fail(e.message),
     };
     let mut target = parent.join(&item.rel[item.rel.len() - 1]);
     let mut kept = None;
@@ -346,6 +353,9 @@ fn write_file(
     progress.set_current(&entry.path);
     let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(&target) {
         Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            return Outcome::Denied(name.clone(), format!("cannot create '{}': {e}", target.display()));
+        }
         Err(e) => return fail(format!("cannot create '{}': {e}", target.display())),
     };
     let mut written = 0u64;
@@ -433,7 +443,20 @@ pub fn execute(
         return Err(Error::Blocked(format!("confirmation is required: {}", list.join("; "))));
     }
     let guard = Guard::new(opts);
-    fs::create_dir_all(&plan.base)?;
+    if let Err(e) = fs::create_dir_all(&plan.base) {
+        if e.kind() == io::ErrorKind::PermissionDenied {
+            // a report instead of an error: the caller can offer to retry with more rights
+            return Ok(ExtractReport {
+                needs_admin: true,
+                failed: vec![Issue {
+                    path: plan.base.display().to_string(),
+                    message: format!("cannot create the folder: {e}"),
+                }],
+                ..Default::default()
+            });
+        }
+        return Err(e.into());
+    }
     let mut report = ExtractReport {
         blocked: plan.blocked.clone(),
         ..Default::default()
@@ -446,10 +469,13 @@ pub fn execute(
     for item in plan.items.iter().filter(|i| i.kind == EntryKind::Dir) {
         match safepath::ensure_dirs(&plan.base, &item.rel) {
             Ok(_) => report.dirs += 1,
-            Err(m) => report.failed.push(Issue {
-                path: archive.entries()[item.index].path.clone(),
-                message: m,
-            }),
+            Err(e) => {
+                report.needs_admin |= e.denied;
+                report.failed.push(Issue {
+                    path: archive.entries()[item.index].path.clone(),
+                    message: e.message,
+                });
+            }
         }
     }
 
@@ -517,6 +543,10 @@ pub fn execute(
             Outcome::Failed(path, message) => report.failed.push(Issue { path, message }),
             Outcome::Cancelled => report.cancelled = true,
             Outcome::Stopped(m) => report.stopped = Some(m),
+            Outcome::Denied(path, message) => {
+                report.needs_admin = true;
+                report.failed.push(Issue { path, message });
+            }
         }
     }
     if progress.is_cancelled() {

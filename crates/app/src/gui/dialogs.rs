@@ -5,7 +5,7 @@ use super::preview;
 use super::{AfterOpen, App, CreateDialog, ExtractDialog, FORMATS, PasswordDialog, ResultInfo, UpdateState, theme};
 use crate::i18n::{self, Key, Lang, t, tf};
 use crate::installer::{self, Env};
-use crate::{diag, update, winint};
+use crate::{diag, shell, update, winint};
 use eframe::egui::{self, Align2, RichText, Ui, vec2};
 use packrat_core::Password;
 use packrat_core::create::{CreateOptions, CreateReport, create_archive};
@@ -36,12 +36,6 @@ fn default_dest(app: &App) -> String {
     std::env::var("USERPROFILE")
         .map(|p| format!("{p}\\Documents"))
         .unwrap_or_default()
-}
-
-pub(super) fn archive_stem_name(p: &Path) -> String {
-    p.file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "archive".into())
 }
 
 impl App {
@@ -97,6 +91,34 @@ impl App {
         if selected_only {
             opts.selection = Some(l.tree.entries_under(&l.selected));
         }
+        if let Some(names) = self.pending_names.take() {
+            let wanted: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+            opts.selection = Some(
+                l.archive
+                    .entries()
+                    .iter()
+                    .filter(|e| wanted.contains(e.path.as_str()))
+                    .map(|e| e.index)
+                    .collect(),
+            );
+        }
+        opts.keep_partial = self.repair_mode;
+        if let Some(r) = self.resolution_override {
+            opts.default_resolution = r;
+        }
+        // what an elevated retry would need to repeat this extraction
+        self.last_extract = l.path.clone().map(|archive| crate::admin::Job {
+            archive,
+            dest: dest.clone(),
+            smart,
+            entries: opts.selection.as_ref().map(|sel| {
+                sel.iter()
+                    .filter_map(|&i| l.archive.entries().get(i))
+                    .map(|e| e.path.clone())
+                    .collect()
+            }),
+            resolution: "skip".into(),
+        });
         self.settings.last_dest = Some(dest.to_string_lossy().into_owned());
         self.save_settings();
         let archive = l.archive.clone();
@@ -137,7 +159,7 @@ impl App {
                     lines: vec![tf(Key::ErrorGeneric, &[&e])],
                     details: vec![],
                     folder: None,
-                    wrong_password: false,
+                    ..Default::default()
                 });
             }
             Ok(r) => {
@@ -177,6 +199,7 @@ impl App {
                 details.extend(r.failed.iter().map(|i| format!("✖ {} — {}", i.path, i.message)));
                 details.extend(r.skipped_existing.iter().map(|p| format!("⏭ {p}")));
                 details.extend(r.kept_both.iter().map(|(a, b)| format!("⧉ {a} → {b}")));
+                let admin = r.needs_admin.then(|| self.last_extract.clone()).flatten();
                 let wrong_password = r
                     .failed
                     .iter()
@@ -187,6 +210,8 @@ impl App {
                     details,
                     folder: Some(dest),
                     wrong_password,
+                    admin,
+                    ..Default::default()
                 });
             }
         }
@@ -218,7 +243,7 @@ impl App {
         self.start_create(ctx);
     }
 
-    fn start_create(&mut self, ctx: &egui::Context) {
+    pub(super) fn start_create(&mut self, ctx: &egui::Context) {
         let Some(c) = &self.create else { return };
         if self.demo {
             self.show_toast(t(Key::DemoNoWrite).to_owned());
@@ -261,7 +286,7 @@ impl App {
                     lines: vec![tf(Key::ErrorGeneric, &[&e])],
                     details: vec![],
                     folder: None,
-                    wrong_password: false,
+                    ..Default::default()
                 });
             }
             Ok(r) => {
@@ -289,7 +314,7 @@ impl App {
                     lines,
                     details,
                     folder: output.parent().map(Path::to_path_buf),
-                    wrong_password: false,
+                    ..Default::default()
                 });
             }
         }
@@ -422,22 +447,9 @@ impl App {
         let Some(c) = self.create.as_mut() else { return };
         if !c.output_edited {
             let ext = App::format_from_index(c.format).extension();
-            let (base, parent) = match c.items.first() {
-                Some(first) => (
-                    if c.items.len() == 1 {
-                        archive_stem_name(first)
-                    } else {
-                        first
-                            .parent()
-                            .and_then(|p| p.file_name())
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| "archive".into())
-                    },
-                    first.parent().map(Path::to_path_buf).unwrap_or_default(),
-                ),
-                None => ("archive".into(), PathBuf::new()),
-            };
-            c.output = parent.join(format!("{base}.{ext}")).to_string_lossy().into_owned();
+            c.output = super::actions::default_output(&c.items, ext)
+                .to_string_lossy()
+                .into_owned();
         }
         let (mut go, mut close) = (false, false);
         let mut remove = None;
@@ -556,6 +568,8 @@ impl App {
         let mut close = false;
         let mut open_folder = None;
         let mut retry_password = false;
+        let mut admin_job = None;
+        let mut repair_path = None;
         let title = if r.ok { "✔" } else { "⚠" };
         window(title).show(ctx, |ui| {
             ui.set_min_width(480.0);
@@ -579,8 +593,21 @@ impl App {
                     });
                 });
             }
+            if r.admin.is_some() {
+                ui.label(RichText::new(t(Key::AdminHint)).color(theme::PALETTE.warn));
+            }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
+                if let Some(j) = &r.admin
+                    && ui.button(t(Key::AdminRetry)).clicked()
+                {
+                    admin_job = Some(j.clone());
+                }
+                if let Some(p) = &r.repair
+                    && ui.button(t(Key::RepairButton)).clicked()
+                {
+                    repair_path = Some(p.clone());
+                }
                 if let Some(f) = &r.folder
                     && ui.button(t(Key::OpenFolder)).clicked()
                 {
@@ -597,7 +624,13 @@ impl App {
         if let Some(f) = open_folder {
             winint::show_in_explorer(&f);
         }
-        if retry_password {
+        if let Some(job) = admin_job {
+            self.result = None;
+            self.retry_as_admin(job);
+        } else if let Some(p) = repair_path {
+            self.result = None;
+            self.repair_open(ctx, p);
+        } else if retry_password {
             self.result = None;
             self.ask_password_for_open_archive();
         } else if close {
@@ -614,6 +647,13 @@ impl App {
         let mut check = false;
         let mut install = false;
         let mut note: Option<String> = None;
+        let env = Env::real();
+        let exe = std::env::current_exe().unwrap_or_default();
+        let menu_registered = shell::is_registered(&env);
+        let assoc_list = shell::associated_exts(&env);
+        let mut explorer_menu: Option<bool> = None;
+        let mut assoc: Option<bool> = None;
+        let mut open_default_apps = false;
         egui::Window::new(RichText::new(t(Key::SettingsTitle)).strong())
             .open(&mut open)
             .collapsible(false)
@@ -666,6 +706,32 @@ impl App {
                     }
                 });
                 ui.separator();
+                theme::heading(ui, t(Key::ExplorerSection));
+                let mut menu_on = menu_registered;
+                if ui.checkbox(&mut menu_on, t(Key::ExplorerMenu)).changed() {
+                    explorer_menu = Some(menu_on);
+                }
+                ui.label(theme::dim(t(Key::ExplorerMenuHint)));
+                ui.horizontal(|ui| {
+                    if ui.button(t(Key::AssocSet)).clicked() {
+                        assoc = Some(true);
+                    }
+                    ui.add_enabled_ui(!assoc_list.is_empty(), |ui| {
+                        if ui.button(t(Key::AssocRestore)).clicked() {
+                            assoc = Some(false);
+                        }
+                    });
+                });
+                ui.label(theme::dim(if assoc_list.is_empty() {
+                    t(Key::AssocNone).to_owned()
+                } else {
+                    tf(Key::AssocState, &[&assoc_list.join(", ")])
+                }));
+                ui.label(theme::dim(t(Key::AssocHint)));
+                if ui.button(t(Key::AssocOpenSettings)).clicked() {
+                    open_default_apps = true;
+                }
+                ui.separator();
                 theme::heading(ui, t(Key::Diagnostics));
                 ui.horizontal(|ui| {
                     if ui.button(t(Key::OpenLogsFolder)).clicked() {
@@ -694,6 +760,38 @@ impl App {
             });
         if changed {
             self.save_settings();
+            if menu_registered && !self.demo {
+                // menu labels follow the interface language
+                let _ = shell::register(&env, &exe, i18n::lang());
+            }
+        }
+        if self.demo && (explorer_menu.is_some() || assoc.is_some()) {
+            note = Some(t(Key::DemoNoWrite).to_owned());
+        } else {
+            if let Some(on) = explorer_menu {
+                if on {
+                    if let Err(e) = shell::register(&env, &exe, i18n::lang()) {
+                        note = Some(tf(Key::ErrorGeneric, &[&e]));
+                    }
+                } else {
+                    shell::unregister(&env);
+                }
+            }
+            if let Some(on) = assoc {
+                let r = if on {
+                    shell::associate(&env, &exe, &shell::ARCHIVE_EXTS)
+                } else {
+                    shell::restore_associations(&env)
+                };
+                if let Err(e) = r {
+                    note = Some(tf(Key::ErrorGeneric, &[&e]));
+                }
+            }
+        }
+        if open_default_apps {
+            let _ = std::process::Command::new("cmd")
+                .args(["/C", "start", "", "ms-settings:defaultapps"])
+                .spawn();
         }
         if check {
             self.check_updates(ctx, false);
