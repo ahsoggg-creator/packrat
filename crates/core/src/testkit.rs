@@ -10,6 +10,10 @@ pub struct RawEntry {
     /// Unix mode placed in the external attributes (made-by = Unix) when set.
     pub unix_mode: Option<u32>,
     pub extra: Vec<u8>,
+    /// Compress the data with deflate (otherwise it is stored).
+    pub deflate: bool,
+    /// MS-DOS `(date, time)` for the entry; a fixed date when unset.
+    pub dos: Option<(u16, u16)>,
 }
 
 impl RawEntry {
@@ -20,6 +24,8 @@ impl RawEntry {
             flags: 0,
             unix_mode: None,
             extra: Vec::new(),
+            deflate: false,
+            dos: None,
         }
     }
 
@@ -34,11 +40,23 @@ impl RawEntry {
             flags: 0,
             unix_mode: None,
             extra: Vec::new(),
+            deflate: false,
+            dos: None,
         }
     }
 
     pub fn utf8(mut self) -> Self {
         self.flags |= 0x0800;
+        self
+    }
+
+    pub fn deflated(mut self) -> Self {
+        self.deflate = true;
+        self
+    }
+
+    pub fn dated(mut self, year: u16, month: u16, day: u16, hour: u16, minute: u16) -> Self {
+        self.dos = Some((((year - 1980) << 9) | (month << 5) | day, (hour << 11) | (minute << 5)));
         self
     }
 
@@ -55,31 +73,37 @@ pub fn raw_zip(entries: &[RawEntry]) -> Vec<u8> {
     for e in entries {
         let offset = out.len() as u32;
         let crc = crc32fast::hash(&e.data);
+        let (method, body): (u16, Vec<u8>) = if e.deflate && !e.data.is_empty() {
+            (8, crate::codec::deflate::compress_block(&e.data, 6, true))
+        } else {
+            (0, e.data.clone())
+        };
+        let (date, time) = e.dos.unwrap_or((0x21, 0));
         out.extend(0x0403_4b50u32.to_le_bytes());
         out.extend(20u16.to_le_bytes());
         out.extend(e.flags.to_le_bytes());
-        out.extend(0u16.to_le_bytes());
-        out.extend(0u16.to_le_bytes());
-        out.extend(0x21u16.to_le_bytes());
+        out.extend(method.to_le_bytes());
+        out.extend(time.to_le_bytes());
+        out.extend(date.to_le_bytes());
         out.extend(crc.to_le_bytes());
-        out.extend((e.data.len() as u32).to_le_bytes());
+        out.extend((body.len() as u32).to_le_bytes());
         out.extend((e.data.len() as u32).to_le_bytes());
         out.extend((e.name.len() as u16).to_le_bytes());
         out.extend((e.extra.len() as u16).to_le_bytes());
         out.extend(&e.name);
         out.extend(&e.extra);
-        out.extend(&e.data);
+        out.extend(&body);
 
         central.extend(0x0201_4b50u32.to_le_bytes());
         let made_by: u16 = if e.unix_mode.is_some() { (3 << 8) | 63 } else { 63 };
         central.extend(made_by.to_le_bytes());
         central.extend(20u16.to_le_bytes());
         central.extend(e.flags.to_le_bytes());
-        central.extend(0u16.to_le_bytes());
-        central.extend(0u16.to_le_bytes());
-        central.extend(0x21u16.to_le_bytes());
+        central.extend(method.to_le_bytes());
+        central.extend(time.to_le_bytes());
+        central.extend(date.to_le_bytes());
         central.extend(crc.to_le_bytes());
-        central.extend((e.data.len() as u32).to_le_bytes());
+        central.extend((body.len() as u32).to_le_bytes());
         central.extend((e.data.len() as u32).to_le_bytes());
         central.extend((e.name.len() as u16).to_le_bytes());
         central.extend((e.extra.len() as u16).to_le_bytes());
