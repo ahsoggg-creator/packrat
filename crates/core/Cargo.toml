@@ -9,9 +9,11 @@ description = "Packrat: archive formats, smart extraction, safety checks (no UI)
 [dependencies]
 aes = "0.9.3"
 bzip2 = "0.6.1"
+cab = "0.6.0"
 chardetng = { version = "1.0.0", default-features = false }
 crc32fast = "1.5.2"
 ctr = "0.10.1"
+delharc = "0.8.0"
 encoding_rs = "0.8.42"
 flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
 getrandom = "0.4.3"
@@ -25,6 +27,7 @@ sevenz-rust2 = { version = "0.24.0", default-features = false, features = ["aes2
 sha1 = "0.11.0"
 sha2 = "0.11.1"
 tar = { version = "0.4.46", default-features = false }
+unrar = "0.5.8"
 
 [dev-dependencies]
 tempfile = "3.27.0"

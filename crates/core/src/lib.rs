@@ -1,18 +1,26 @@
 //! Packrat core: archive formats, smart extraction and safety checks. No UI.
 
+pub mod ar;
 pub mod archive;
+pub mod cab;
 pub mod codec;
+pub mod cpio;
+pub mod cpiostream;
 pub mod create;
 pub mod encoding;
 pub mod entry;
 pub mod error;
 pub mod extract;
 pub mod input;
+pub mod iso;
+pub mod lha;
 pub mod open;
 pub mod options;
 pub mod par;
 pub mod preview;
 pub mod progress;
+pub mod ranged;
+pub mod rar;
 pub mod safepath;
 pub mod safety;
 pub mod sevenz;

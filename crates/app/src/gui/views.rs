@@ -93,9 +93,7 @@ impl App {
         let picked = rfd::FileDialog::new()
             .add_filter(
                 "Archives",
-                &[
-                    "zip", "7z", "tar", "gz", "tgz", "bz2", "xz", "txz", "zst", "tzst", "lz4",
-                ],
+                &crate::shell::OPEN_EXTS,
             )
             .add_filter("All files", &["*"])
             .pick_file();

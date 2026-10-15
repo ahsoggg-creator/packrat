@@ -12,9 +12,22 @@ use crate::{i18n, settings};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub const ARCHIVE_EXTS: [&str; 11] = [
-    "zip", "7z", "tar", "gz", "tgz", "bz2", "xz", "txz", "zst", "tzst", "lz4",
+/// Formats Packrat takes over when the user asks for associations.
+pub const ARCHIVE_EXTS: [&str; 20] = [
+    "zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "tbz2", "tbz", "xz", "txz", "zst", "tzst", "lz4", "cab", "lzh", "lha",
+    "cpio", "deb", "rpm",
 ];
+/// Archives that get the Explorer menu but are never associated: Windows opens them itself (mounts an image).
+const MENU_ONLY_EXTS: [&str; 1] = ["iso"];
+/// Everything the "Open archive" dialog offers: the above plus formats that are ZIP or AR inside.
+pub const OPEN_EXTS: [&str; 33] = [
+    "zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "tbz2", "tbz", "xz", "txz", "zst", "tzst", "lz4", "cab", "lzh", "lha",
+    "cpio", "deb", "rpm", "iso", "ar", "a", "jar", "war", "apk", "xpi", "whl", "nupkg", "vsix", "epub", "cbz", "cbr",
+];
+
+fn menu_exts() -> impl Iterator<Item = &'static str> {
+    ARCHIVE_EXTS.into_iter().chain(MENU_ONLY_EXTS)
+}
 pub const PROG_ID: &str = "Packrat.Archive";
 const MENU_KEY: &str = "Packrat";
 
@@ -79,8 +92,7 @@ mod imp {
         let base = classes(env);
         let not_archive = format!(
             "NOT ({})",
-            ARCHIVE_EXTS
-                .iter()
+            menu_exts()
                 .map(|x| format!("System.FileExtension:=\".{x}\""))
                 .collect::<Vec<_>>()
                 .join(" OR ")
@@ -101,7 +113,7 @@ mod imp {
             &ADD_ITEMS,
             lang,
         )?;
-        for ext in ARCHIVE_EXTS {
+        for ext in menu_exts() {
             cascade(
                 &format!(r"{base}\SystemFileAssociations\.{ext}\shell\{MENU_KEY}"),
                 MENU_KEY,
@@ -121,11 +133,7 @@ mod imp {
             format!(r"{base}\*\shell\{MENU_KEY}"),
             format!(r"{base}\Directory\shell\{MENU_KEY}"),
         ];
-        paths.extend(
-            ARCHIVE_EXTS
-                .iter()
-                .map(|x| format!(r"{base}\SystemFileAssociations\.{x}\shell\{MENU_KEY}")),
-        );
+        paths.extend(menu_exts().map(|x| format!(r"{base}\SystemFileAssociations\.{x}\shell\{MENU_KEY}")));
         for p in paths {
             let _ = hkcu().delete_subkey_all(p);
         }
