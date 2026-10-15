@@ -121,6 +121,18 @@ impl Archive for SevenZArchive {
         &self.entries
     }
 
+    fn skip_cost(&self, index: usize) -> u64 {
+        // a solid block is decoded from its first file up to the wanted one
+        let map = &self.archive.stream_map;
+        match map.file_block_index.get(index).copied().flatten() {
+            Some(b) => self.entries[map.block_first_file_index[b]..index]
+                .iter()
+                .map(|e| e.size)
+                .sum(),
+            None => 0,
+        }
+    }
+
     fn open_entry(&self, index: usize) -> Result<EntryReader<'_>> {
         let e = self
             .entries
