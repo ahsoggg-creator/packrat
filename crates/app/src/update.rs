@@ -92,10 +92,13 @@ pub fn sha256_file(path: &Path) -> std::io::Result<String> {
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Short requests (the release information, the checksum file).
+/// Short requests (the release information, the checksum file). Connecting gets its own limit and the whole request
+/// a generous one: GitHub is slow to answer on some links, and `with_retries` covers the rest.
 fn agent() -> ureq::Agent {
+    use std::time::Duration;
     ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(60)))
+        .timeout_connect(Some(Duration::from_secs(20)))
+        .timeout_global(Some(Duration::from_secs(120)))
         .user_agent(format!("Packrat/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .into()
@@ -114,15 +117,32 @@ fn download_agent() -> ureq::Agent {
         .into()
 }
 
+/// Runs `f` up to three times: a timeout or a dropped connection on the first try is common and usually passes.
+fn with_retries<T>(mut f: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+    let mut last = String::new();
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 /// Asks GitHub for the latest release. `Ok(None)` when this build is up to date.
 pub fn check_latest() -> Result<Option<Release>, String> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let mut resp = agent()
-        .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .call()
-        .map_err(|e| e.to_string())?;
-    let body = resp.body_mut().read_to_string().map_err(|e| e.to_string())?;
+    let body = with_retries(|| {
+        let mut resp = agent()
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .call()
+            .map_err(|e| e.to_string())?;
+        resp.body_mut().read_to_string().map_err(|e| e.to_string())
+    })?;
     let rel = parse_release(&body)?;
     Ok((rel.version > current_version()).then_some(rel))
 }
@@ -133,19 +153,21 @@ pub fn due(settings: &Settings, now: i64) -> bool {
 
 /// Downloads the new exe next to `current`, verifies it against the published checksum, and returns its path.
 pub fn download_verified(rel: &Release, current: &Path, progress: &dyn Fn(u64, u64)) -> Result<PathBuf, String> {
-    let sums_text = agent()
-        .get(&rel.sums_url)
-        .call()
-        .map_err(|e| e.to_string())?
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| e.to_string())?;
+    let sums_text = with_retries(|| {
+        agent()
+            .get(&rel.sums_url)
+            .call()
+            .map_err(|e| e.to_string())?
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| e.to_string())
+    })?;
     let expected = parse_sums(&sums_text)
         .remove("Packrat.exe")
         .ok_or("SHA256SUMS.txt has no entry for Packrat.exe")?;
 
     let target = current.with_extension("exe.new");
-    let result = (|| -> Result<(), String> {
+    let result = with_retries(|| -> Result<(), String> {
         let resp = download_agent().get(&rel.exe_url).call().map_err(|e| e.to_string())?;
         let total = resp.body().content_length().unwrap_or(0);
         let mut reader = resp.into_body().into_reader().take(MAX_DOWNLOAD);
@@ -162,7 +184,7 @@ pub fn download_verified(rel: &Release, current: &Path, progress: &dyn Fn(u64, u
             progress(done, total);
         }
         out.flush().map_err(|e| e.to_string())
-    })();
+    });
     if let Err(e) = result {
         let _ = fs::remove_file(&target);
         return Err(e);
