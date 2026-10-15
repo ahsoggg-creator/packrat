@@ -62,3 +62,116 @@ fn bad_usage_exits_with_2() {
     assert_eq!(cli().output().unwrap().status.code(), Some(2));
     assert!(cli().arg("--version").output().unwrap().status.success());
 }
+
+#[test]
+fn passwords_come_from_the_environment_or_a_file_never_from_arguments() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("secret");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.txt"), "classified").unwrap();
+    let archive = dir.path().join("secret.7z");
+    let out = cli()
+        .arg("create")
+        .arg(&archive)
+        .arg(&src)
+        .env("PACKRAT_PASSWORD", "pw123")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let dest = dir.path().join("out");
+    fs::create_dir(&dest).unwrap();
+    let out = cli()
+        .arg("extract")
+        .arg(&archive)
+        .arg("-o")
+        .arg(&dest)
+        .env_remove("PACKRAT_PASSWORD")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("password is required"));
+
+    let pwfile = dir.path().join("pw.txt");
+    fs::write(&pwfile, "pw123\n").unwrap();
+    let out = cli()
+        .arg("extract")
+        .arg(&archive)
+        .arg("-o")
+        .arg(&dest)
+        .arg("--password-file")
+        .arg(&pwfile)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(fs::read_to_string(dest.join("secret/a.txt")).unwrap(), "classified");
+
+    let out = cli()
+        .args(["list", "--password", "pw123"])
+        .arg(&archive)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "there is no --password option");
+}
+
+#[test]
+fn old_zip_names_can_be_decoded_with_an_explicit_encoding() {
+    use packrat_core::testkit::{RawEntry, raw_zip};
+    let dir = tempfile::tempdir().unwrap();
+    let name = encoding_rs::IBM866.encode("Документы/Отчёт за 2024.txt").0.into_owned();
+    let zip = dir.path().join("old.zip");
+    fs::write(&zip, raw_zip(&[RawEntry::file(name, "x")])).unwrap();
+    let out = cli().arg("list").arg(&zip).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Документы/Отчёт за 2024.txt"), "{text}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("CP866"));
+    let out = cli()
+        .arg("list")
+        .arg(&zip)
+        .args(["--encoding", "cp1251"])
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("Документы"),
+        "forcing another code page changes the names"
+    );
+    let out = cli()
+        .arg("list")
+        .arg(&zip)
+        .args(["--encoding", "klingon"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn risky_archives_need_explicit_acceptance() {
+    use packrat_core::testkit::{RawEntry, raw_zip};
+    let dir = tempfile::tempdir().unwrap();
+    let zip = dir.path().join("bomb.zip");
+    fs::write(
+        &zip,
+        raw_zip(&[RawEntry::file("zeros.bin", vec![0u8; 80 << 20]).deflated()]),
+    )
+    .unwrap();
+    let dest = dir.path().join("out");
+    fs::create_dir(&dest).unwrap();
+    let out = cli().arg("extract").arg(&zip).arg("-o").arg(&dest).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("RISK"));
+    assert_eq!(
+        fs::read_dir(&dest).unwrap().count(),
+        0,
+        "nothing written before acceptance"
+    );
+    let out = cli()
+        .arg("extract")
+        .arg(&zip)
+        .arg("-o")
+        .arg(&dest)
+        .arg("--accept-risks")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(fs::metadata(dest.join("zeros.bin")).unwrap().len(), 80 << 20);
+}

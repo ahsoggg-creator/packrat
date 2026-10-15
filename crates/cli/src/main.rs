@@ -1,6 +1,7 @@
 use packrat_core::create::{CreateOptions, Format, create_archive};
+use packrat_core::encoding::NameEncoding;
 use packrat_core::extract::{self, ExtractOptions, Resolution};
-use packrat_core::{Archive, EntryKind, Progress, open, timeutil};
+use packrat_core::{Archive, EntryKind, OpenOptions, Password, Progress, open, timeutil};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -8,10 +9,12 @@ const HELP: &str = "\
 packrat-cli — Packrat archive tool
 
 USAGE:
-  packrat-cli list <archive>
+  packrat-cli list <archive> [--encoding NAME] [PASSWORD OPTIONS]
   packrat-cli extract <archive> [NAMES...] [-o DIR] [--smart] [--threads N]
-                      [--skip | --overwrite | --keep-both]
+                      [--skip | --overwrite | --keep-both] [--accept-risks]
+                      [--encoding NAME] [PASSWORD OPTIONS]
   packrat-cli create <output> <paths...> [--format FMT] [--level N] [--threads N]
+                      [PASSWORD OPTIONS] [--no-encrypt-names]
   packrat-cli bench-gen <dir> [--mb N]     write the deterministic data set used by scripts/bench.ps1
   packrat-cli --version | --help
 
@@ -22,6 +25,16 @@ EXTRACT:
   --smart      one root folder goes straight to the target, one file lands next to it,
                loose items get a folder named after the archive
   existing files are skipped unless --overwrite or --keep-both is given
+
+PASSWORD OPTIONS: --ask-password | --password-file FILE | env PACKRAT_PASSWORD
+  Passwords are never taken from the command line. Creating: ZIP and 7z get AES-256; 7z also hides file names
+  (--no-encrypt-names keeps them visible). TAR cannot be encrypted.
+
+ENCODING: for old ZIP files whose names have no encoding information, Packrat guesses (cp866, cp1251, cp437,
+  shift_jis, gbk, big5, euc-kr); --encoding NAME forces one.
+
+RISKS: before extracting, archives are checked for bomb-like traits (huge expansion ratio, too little disk space,
+  overlapping entries, deeply nested archives). If anything is found nothing is extracted unless --accept-risks.
 
 EXIT CODES: 0 success, 1 finished with errors or blocked entries, 2 bad usage or fatal error
 ";
@@ -107,13 +120,85 @@ fn main() -> ExitCode {
     }
 }
 
-fn open_archive(path: &str) -> Result<Box<dyn Archive>, String> {
-    open::open(&PathBuf::from(path)).map_err(|e| format!("{path}: {e}"))
+/// Reads a line without echoing it (a password prompt).
+#[cfg(windows)]
+fn read_hidden_line() -> std::io::Result<String> {
+    use windows_sys::Win32::System::Console::{
+        ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
+    };
+    // SAFETY: plain console API calls on the process's own stdin handle.
+    let (handle, old) = unsafe {
+        let h = GetStdHandle(STD_INPUT_HANDLE);
+        let mut mode = 0u32;
+        let is_console = GetConsoleMode(h, &mut mode) != 0;
+        if is_console {
+            SetConsoleMode(h, mode & !ENABLE_ECHO_INPUT);
+        }
+        (h, is_console.then_some(mode))
+    };
+    let mut line = String::new();
+    let r = std::io::stdin().read_line(&mut line);
+    if let Some(mode) = old {
+        // SAFETY: restores the mode read above.
+        unsafe { SetConsoleMode(handle, mode) };
+        eprintln!();
+    }
+    r.map(|_| line.trim_end_matches(['\r', '\n']).to_owned())
 }
 
-fn cmd_list(args: Args) -> Result<u8, String> {
+#[cfg(not(windows))]
+fn read_hidden_line() -> std::io::Result<String> {
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map(|_| line.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+/// `--encoding NAME`, and a password from `--password-file FILE`, `--ask-password` or `PACKRAT_PASSWORD`.
+/// There is deliberately no `--password VALUE`: command lines end up in shell history and process lists.
+fn open_options(args: &mut Args) -> Result<OpenOptions, String> {
+    let mut o = OpenOptions::default();
+    if let Some(name) = args.value(&["--encoding"])? {
+        o.encoding = Some(NameEncoding::from_name(&name).ok_or_else(|| {
+            format!("unknown encoding '{name}' (try cp866, cp1251, cp437, shift_jis, gbk, big5, euc-kr, utf-8)")
+        })?);
+    }
+    if let Some(file) = args.value(&["--password-file"])? {
+        let text = std::fs::read_to_string(&file).map_err(|e| format!("{file}: {e}"))?;
+        o.password = Some(Password::new(text.lines().next().unwrap_or("")));
+    } else if args.flag("--ask-password") {
+        eprint!("Password: ");
+        o.password = Some(Password::new(&read_hidden_line().map_err(|e| e.to_string())?));
+    } else if let Ok(p) = std::env::var("PACKRAT_PASSWORD") {
+        o.password = Some(Password::new(&p));
+    }
+    Ok(o)
+}
+
+fn open_archive(path: &str, opts: &OpenOptions) -> Result<Box<dyn Archive>, String> {
+    open::open_with(&PathBuf::from(path), opts).map_err(|e| match e {
+        packrat_core::Error::PasswordRequired => {
+            format!("{path}: a password is required (use --ask-password or --password-file)")
+        }
+        other => format!("{path}: {other}"),
+    })
+}
+
+fn cmd_list(mut args: Args) -> Result<u8, String> {
+    let oo = open_options(&mut args)?;
     let path = args.0.first().cloned().ok_or("list: archive path is missing")?;
-    let a = open_archive(&path)?;
+    let a = open_archive(&path, &oo)?;
+    if let Some(l) = a.legacy_names() {
+        eprintln!(
+            "note: {} names have no encoding information; decoded as {} (detected: {}). Use --encoding to change.",
+            l.indices.len(),
+            l.current.label(),
+            l.detection.best.label()
+        );
+    }
+    if a.entries().iter().any(|e| e.method.starts_with("ZipCrypto")) {
+        eprintln!("warning: this archive uses ZipCrypto, a weak encryption (known-plaintext attacks recover the keys)");
+    }
     println!("{} — {}", path, a.kind().label());
     println!("{:>12} {:>12}  {:<16}  Name", "Size", "Packed", "Modified");
     let (mut files, mut dirs, mut size, mut packed) = (0u64, 0u64, 0u64, 0u64);
@@ -148,6 +233,8 @@ fn cmd_list(args: Args) -> Result<u8, String> {
 }
 
 fn cmd_extract(mut args: Args) -> Result<u8, String> {
+    let oo = open_options(&mut args)?;
+    let accept_risks = args.flag("--accept-risks");
     let smart = args.flag("--smart");
     let overwrite = args.flag("--overwrite");
     let keep_both = args.flag("--keep-both");
@@ -160,7 +247,7 @@ fn cmd_extract(mut args: Args) -> Result<u8, String> {
     let path = args.0.first().cloned().ok_or("extract: archive path is missing")?;
     let wanted: Vec<String> = args.0.iter().skip(1).map(|s| s.replace('\\', "/")).collect();
 
-    let a = open_archive(&path)?;
+    let a = open_archive(&path, &oo)?;
     let name = PathBuf::from(&path)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -168,6 +255,8 @@ fn cmd_extract(mut args: Args) -> Result<u8, String> {
     let mut opts = ExtractOptions::new(&out, name);
     opts.smart = smart;
     opts.threads = threads;
+    opts.accept_risks = accept_risks;
+    opts.archive_len = std::fs::metadata(&path).map_or(0, |m| m.len());
     opts.default_resolution = if overwrite {
         Resolution::Replace
     } else if keep_both {
@@ -196,6 +285,13 @@ fn cmd_extract(mut args: Args) -> Result<u8, String> {
     let progress = Progress::new();
     let started = std::time::Instant::now();
     let plan = extract::plan(&*a, &opts);
+    if !plan.risks.is_empty() && !accept_risks {
+        for r in &plan.risks {
+            eprintln!("RISK: {}", r.describe());
+        }
+        eprintln!("nothing was extracted; run again with --accept-risks to continue at your own risk");
+        return Ok(1);
+    }
     println!("extracting to {}", plan.base.display());
     let report = extract::execute(&*a, &plan, &opts, &progress).map_err(|e| e.to_string())?;
     let secs = started.elapsed().as_secs_f64();
@@ -214,13 +310,20 @@ fn cmd_extract(mut args: Args) -> Result<u8, String> {
     for b in &report.blocked {
         eprintln!("BLOCKED {}: {}", b.path, b.message);
     }
+    if let Some(m) = &report.stopped {
+        eprintln!("STOPPED: {m}");
+    }
     for f in &report.failed {
         eprintln!("FAILED {}: {}", f.path, f.message);
     }
-    Ok(u8::from(!report.blocked.is_empty() || !report.failed.is_empty()))
+    Ok(u8::from(
+        !report.blocked.is_empty() || !report.failed.is_empty() || report.stopped.is_some(),
+    ))
 }
 
 fn cmd_create(mut args: Args) -> Result<u8, String> {
+    let no_names = args.flag("--no-encrypt-names");
+    let oo = open_options(&mut args)?;
     let format_name = args.value(&["--format", "-f"])?;
     let level = args.number(&["--level", "-l"])?;
     let threads = args.number(&["--threads", "-j"])?.unwrap_or(0);
@@ -246,6 +349,8 @@ fn cmd_create(mut args: Args) -> Result<u8, String> {
         opts.level = l.clamp(1, 9) as u32;
     }
     opts.threads = threads;
+    opts.password = oo.password;
+    opts.encrypt_names = !no_names;
 
     let started = std::time::Instant::now();
     let report = create_archive(&output, &inputs, &opts, &Progress::new()).map_err(|e| e.to_string())?;
