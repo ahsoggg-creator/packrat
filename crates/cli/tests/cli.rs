@@ -175,3 +175,74 @@ fn risky_archives_need_explicit_acceptance() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(fs::metadata(dest.join("zeros.bin")).unwrap().len(), 80 << 20);
 }
+
+#[test]
+fn test_command_finds_damage_and_repair_rescues_a_cut_zip() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("docs");
+    fs::create_dir_all(&src).unwrap();
+    for i in 0..8 {
+        fs::write(
+            src.join(format!("f{i}.txt")),
+            format!("content of file {i} ").repeat(3000),
+        )
+        .unwrap();
+    }
+    let archive = dir.path().join("docs.zip");
+    assert!(
+        cli()
+            .arg("create")
+            .arg(&archive)
+            .arg(&src)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let out = cli().arg("test").arg(&archive).arg("--sha256").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && text.contains("0 damaged") && text.contains("SHA-256 "),
+        "{text}"
+    );
+
+    let mut bytes = fs::read(&archive).unwrap();
+    let at = bytes.len() / 2;
+    for b in &mut bytes[at..at + 30] {
+        *b ^= 0x5A;
+    }
+    let damaged = dir.path().join("damaged.zip");
+    fs::write(&damaged, &bytes).unwrap();
+    let out = cli().arg("test").arg(&damaged).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("DAMAGED"));
+
+    let cut = dir.path().join("cut.zip");
+    fs::write(&cut, &fs::read(&archive).unwrap()[..bytes.len() * 7 / 10]).unwrap();
+    assert_eq!(
+        cli().arg("list").arg(&cut).output().unwrap().status.code(),
+        Some(2),
+        "a cut ZIP does not open normally"
+    );
+    let dest = dir.path().join("out");
+    fs::create_dir(&dest).unwrap();
+    let out = cli()
+        .arg("extract")
+        .arg(&cut)
+        .arg("-o")
+        .arg(&dest)
+        .arg("--repair")
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("scanning local headers"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dest.join("docs/f0.txt").exists());
+    assert_eq!(
+        fs::read_to_string(dest.join("docs/f0.txt")).unwrap(),
+        "content of file 0 ".repeat(3000)
+    );
+}

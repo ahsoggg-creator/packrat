@@ -33,11 +33,18 @@ pub struct OpenOptions {
     /// Code page for ZIP names that carry no encoding information; `None` = detect.
     pub encoding: Option<NameEncoding>,
     pub password: Option<Password>,
+    /// A ZIP without a usable central directory is read by scanning its local headers.
+    pub recover: bool,
 }
 
 impl OpenOptions {
     pub fn with_encoding(mut self, e: NameEncoding) -> Self {
         self.encoding = Some(e);
+        self
+    }
+
+    pub fn with_recover(mut self) -> Self {
+        self.recover = true;
         self
     }
 

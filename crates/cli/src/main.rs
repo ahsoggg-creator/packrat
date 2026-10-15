@@ -11,8 +11,9 @@ packrat-cli — Packrat archive tool
 USAGE:
   packrat-cli list <archive> [--encoding NAME] [PASSWORD OPTIONS]
   packrat-cli extract <archive> [NAMES...] [-o DIR] [--smart] [--threads N]
-                      [--skip | --overwrite | --keep-both] [--accept-risks]
+                      [--skip | --overwrite | --keep-both] [--accept-risks] [--repair]
                       [--encoding NAME] [PASSWORD OPTIONS]
+  packrat-cli test <archive> [--sha256] [--threads N] [--encoding NAME] [PASSWORD OPTIONS]
   packrat-cli create <output> <paths...> [--format FMT] [--level N] [--threads N]
                       [PASSWORD OPTIONS] [--no-encrypt-names]
   packrat-cli bench-gen <dir> [--mb N]     write the deterministic data set used by scripts/bench.ps1
@@ -35,6 +36,12 @@ ENCODING: for old ZIP files whose names have no encoding information, Packrat gu
 
 RISKS: before extracting, archives are checked for bomb-like traits (huge expansion ratio, too little disk space,
   overlapping entries, deeply nested archives). If anything is found nothing is extracted unless --accept-risks.
+
+TEST: reads every file and checks it against the archive's checksums (CRC-32 in ZIP and 7z, the stream checks for
+  TAR); --sha256 also prints the SHA-256 of the archive file. Exit code 1 when anything is damaged.
+
+REPAIR: extract --repair rebuilds the list of a damaged ZIP from its local headers (a cut-off download, a lost
+  central directory) and extracts everything that can be read; damaged entries are kept as NAME.partial.
 
 EXIT CODES: 0 success, 1 finished with errors or blocked entries, 2 bad usage or fatal error
 ";
@@ -108,6 +115,7 @@ fn main() -> ExitCode {
         "list" | "l" => cmd_list(args),
         "extract" | "x" => cmd_extract(args),
         "create" | "c" | "a" => cmd_create(args),
+        "test" | "t" => cmd_test(args),
         "bench-gen" => cmd_bench_gen(args),
         other => Err(format!("unknown command '{other}' (see --help)")),
     };
@@ -233,7 +241,9 @@ fn cmd_list(mut args: Args) -> Result<u8, String> {
 }
 
 fn cmd_extract(mut args: Args) -> Result<u8, String> {
-    let oo = open_options(&mut args)?;
+    let mut oo = open_options(&mut args)?;
+    let repair = args.flag("--repair");
+    oo.recover = repair;
     let accept_risks = args.flag("--accept-risks");
     let smart = args.flag("--smart");
     let overwrite = args.flag("--overwrite");
@@ -256,6 +266,13 @@ fn cmd_extract(mut args: Args) -> Result<u8, String> {
     opts.smart = smart;
     opts.threads = threads;
     opts.accept_risks = accept_risks;
+    opts.keep_partial = repair;
+    if a.is_recovered() {
+        eprintln!(
+            "note: the central directory is unusable; {} entries were found by scanning local headers",
+            a.entries().len()
+        );
+    }
     opts.archive_len = std::fs::metadata(&path).map_or(0, |m| m.len());
     opts.default_resolution = if overwrite {
         Resolution::Replace
@@ -466,4 +483,31 @@ fn cmd_bench_gen(mut args: Args) -> Result<u8, String> {
     }
     println!("wrote {} to {}", human(written + text_bytes + bin_bytes), dir.display());
     Ok(0)
+}
+
+fn cmd_test(mut args: Args) -> Result<u8, String> {
+    let oo = open_options(&mut args)?;
+    let sha = args.flag("--sha256");
+    let threads = args.number(&["--threads", "-j"])?.unwrap_or(0);
+    let path = args.0.first().cloned().ok_or("test: archive path is missing")?;
+    let a = open_archive(&path, &oo)?;
+    let started = std::time::Instant::now();
+    let report = packrat_core::verify::verify(&*a, None, threads, &Progress::new());
+    for f in &report.failures {
+        let name = if f.path.is_empty() { "(stream)" } else { f.path.as_str() };
+        eprintln!("DAMAGED {name}: {}", f.message);
+    }
+    println!(
+        "{path}: {} files checked ({}), {} damaged, {:.2} s",
+        report.ok + report.failures.len() as u64,
+        human(report.bytes),
+        report.failures.len(),
+        started.elapsed().as_secs_f64()
+    );
+    if sha {
+        let hash =
+            packrat_core::verify::sha256_file(&PathBuf::from(&path), &Progress::new()).map_err(|e| e.to_string())?;
+        println!("SHA-256 {hash}");
+    }
+    Ok(u8::from(!report.is_clean()))
 }

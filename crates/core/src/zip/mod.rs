@@ -4,6 +4,7 @@
 pub mod crypto;
 mod extra;
 pub mod read;
+mod recover;
 pub mod write;
 
 pub use read::ZipArchive;

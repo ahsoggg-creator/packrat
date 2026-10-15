@@ -147,6 +147,9 @@ impl Archive for TarArchive {
                 visit(entry, &mut e)?;
             }
         }
+        // read the stream to its end: the checksum of a compressed stream sits after the TAR end marker
+        let mut rest = archive.into_inner();
+        io::copy(&mut rest, &mut io::sink()).map_err(Error::from)?;
         Ok(())
     }
 }

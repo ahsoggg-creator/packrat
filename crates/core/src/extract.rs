@@ -49,6 +49,8 @@ pub struct ExtractOptions {
     /// The user saw `Plan::risks` and chose to continue. Without it `execute` refuses to run when there are
     /// risks, and enforces the limits while unpacking.
     pub accept_risks: bool,
+    /// Repair mode: when an entry turns out to be damaged, keep what was decoded as `name.partial`.
+    pub keep_partial: bool,
 }
 
 impl ExtractOptions {
@@ -65,6 +67,7 @@ impl ExtractOptions {
             limits: Limits::default(),
             archive_len: 0,
             accept_risks: false,
+            keep_partial: false,
         }
     }
 }
@@ -379,11 +382,39 @@ fn write_file(
         }
         Err(e) => {
             drop(file);
-            let _ = fs::remove_file(&target);
             match Error::from(e) {
-                Error::Cancelled => Outcome::Cancelled,
-                Error::Blocked(m) => Outcome::Stopped(m),
-                other => fail(other.to_string()),
+                Error::Cancelled => {
+                    let _ = fs::remove_file(&target);
+                    Outcome::Cancelled
+                }
+                Error::Blocked(m) => {
+                    let _ = fs::remove_file(&target);
+                    Outcome::Stopped(m)
+                }
+                other if opts.keep_partial && written > 0 => {
+                    // damaged entry: what could be decoded is worth keeping, under a name that says so
+                    let partial = {
+                        let mut os = target.clone().into_os_string();
+                        os.push(".partial");
+                        PathBuf::from(os)
+                    };
+                    let partial = if fs::symlink_metadata(&partial).is_ok() {
+                        unique_name(&partial)
+                    } else {
+                        partial
+                    };
+                    match fs::rename(&target, &partial) {
+                        Ok(()) => fail(format!("{other} — {written} bytes kept as '{}'", partial.display())),
+                        Err(_) => {
+                            let _ = fs::remove_file(&target);
+                            fail(other.to_string())
+                        }
+                    }
+                }
+                other => {
+                    let _ = fs::remove_file(&target);
+                    fail(other.to_string())
+                }
             }
         }
     }

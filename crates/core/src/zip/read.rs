@@ -43,6 +43,7 @@ pub struct ZipArchive {
     comment: Vec<u8>,
     legacy: Option<LegacyNames>,
     password: Option<Password>,
+    recovered: bool,
     /// Absolute offset of the central directory: entry data must end before it.
     data_end: u64,
 }
@@ -164,7 +165,7 @@ fn find_end_record(src: &dyn crate::source::Source) -> Result<EndRecord> {
 
 /// The name as text, or `None` when it is in an unknown legacy code page (no UTF-8 flag, no Unicode Path field,
 /// not valid UTF-8): then the caller decodes it with a detected or user-chosen encoding.
-fn decode_name(raw: &[u8], flags: u16, extra_data: &[u8]) -> Option<String> {
+pub(super) fn decode_name(raw: &[u8], flags: u16, extra_data: &[u8]) -> Option<String> {
     if let Some(n) = extra::unicode_path(extra_data, raw) {
         return Some(n);
     }
@@ -191,7 +192,7 @@ impl LegacyNames {
     }
 }
 
-fn parse_aes_extra(extra_data: &[u8]) -> Option<AesInfo> {
+pub(super) fn parse_aes_extra(extra_data: &[u8]) -> Option<AesInfo> {
     let d = extra::find(extra_data, extra::ID_AES)?;
     if d.len() < 7 || &d[2..4] != b"AE" {
         return None;
@@ -203,7 +204,7 @@ fn parse_aes_extra(extra_data: &[u8]) -> Option<AesInfo> {
     })
 }
 
-fn method_label(method: u16) -> String {
+pub(super) fn method_label(method: u16) -> String {
     match method {
         METHOD_STORE => "Store".into(),
         METHOD_DEFLATE => "Deflate".into(),
@@ -213,6 +214,54 @@ fn method_label(method: u16) -> String {
         99 => "AES".into(),
         n => format!("Method {n}"),
     }
+}
+
+pub(super) struct Parsed {
+    pub entries: Vec<Entry>,
+    pub meta: Vec<Meta>,
+    /// Entries whose names have no encoding information.
+    pub legacy_idx: Vec<usize>,
+    pub comment: Vec<u8>,
+    pub data_end: u64,
+}
+
+fn parse_central_directory(src: &SharedSource) -> Result<Parsed> {
+    let end = find_end_record(&**src)?;
+    if end.cd_size > MAX_CENTRAL_DIRECTORY || end.cd_size > src.len() {
+        return corrupt("central directory size is not plausible");
+    }
+    let Some(cd_start) = end.end_of_cd.checked_sub(end.cd_size) else {
+        return corrupt("central directory does not fit in the file");
+    };
+    // Archives with data in front (self-extractors) store offsets relative to the archive start.
+    let base = cd_start
+        .checked_sub(end.cd_offset)
+        .ok_or_else(|| Error::Corrupt("central directory offset is beyond the file".into()))?;
+    if end.entries > end.cd_size / 46 {
+        return corrupt("entry count does not match the central directory size");
+    }
+    let mut cd = vec![0u8; end.cd_size as usize];
+    read_exact_at(&**src, cd_start, &mut cd)?;
+
+    let mut cur = Cur { b: &cd, p: 0 };
+    let mut entries = Vec::with_capacity(end.entries as usize);
+    let mut meta = Vec::with_capacity(end.entries as usize);
+    let mut legacy_idx: Vec<usize> = Vec::new();
+    for index in 0..end.entries as usize {
+        let (e, m, is_legacy) = parse_central_entry(&mut cur, index, base)?;
+        if is_legacy {
+            legacy_idx.push(index);
+        }
+        entries.push(e);
+        meta.push(m);
+    }
+    Ok(Parsed {
+        entries,
+        meta,
+        legacy_idx,
+        comment: end.comment,
+        data_end: cd_start,
+    })
 }
 
 impl ZipArchive {
@@ -225,35 +274,28 @@ impl ZipArchive {
     }
 
     pub fn from_source_with(src: SharedSource, opts: &OpenOptions) -> Result<Self> {
-        let end = find_end_record(&*src)?;
-        if end.cd_size > MAX_CENTRAL_DIRECTORY || end.cd_size > src.len() {
-            return corrupt("central directory size is not plausible");
-        }
-        let Some(cd_start) = end.end_of_cd.checked_sub(end.cd_size) else {
-            return corrupt("central directory does not fit in the file");
-        };
-        // Archives with data in front (self-extractors) store offsets relative to the archive start.
-        let base = cd_start
-            .checked_sub(end.cd_offset)
-            .ok_or_else(|| Error::Corrupt("central directory offset is beyond the file".into()))?;
-        if end.entries > end.cd_size / 46 {
-            return corrupt("entry count does not match the central directory size");
-        }
-        let mut cd = vec![0u8; end.cd_size as usize];
-        read_exact_at(&*src, cd_start, &mut cd)?;
-
-        let mut cur = Cur { b: &cd, p: 0 };
-        let mut entries = Vec::with_capacity(end.entries as usize);
-        let mut meta = Vec::with_capacity(end.entries as usize);
-        let mut legacy_idx: Vec<usize> = Vec::new();
-        for index in 0..end.entries as usize {
-            let (e, m, is_legacy) = parse_central_entry(&mut cur, index, base)?;
-            if is_legacy {
-                legacy_idx.push(index);
+        match parse_central_directory(&src) {
+            Ok(parsed) => Ok(Self::assemble(src, parsed, opts, false)),
+            Err(e) if opts.recover => {
+                // no usable central directory: rebuild the list from the local headers
+                let parsed = super::recover::scan(&src)?;
+                if parsed.entries.is_empty() {
+                    return Err(e);
+                }
+                Ok(Self::assemble(src, parsed, opts, true))
             }
-            entries.push(e);
-            meta.push(m);
+            Err(e) => Err(e),
         }
+    }
+
+    fn assemble(src: SharedSource, parsed: Parsed, opts: &OpenOptions, recovered: bool) -> Self {
+        let Parsed {
+            mut entries,
+            meta,
+            legacy_idx,
+            comment,
+            data_end,
+        } = parsed;
         let legacy = (!legacy_idx.is_empty()).then(|| {
             let raw: Vec<Vec<u8>> = legacy_idx.iter().map(|&i| entries[i].raw_name.clone()).collect();
             let refs: Vec<&[u8]> = raw.iter().map(Vec::as_slice).collect();
@@ -269,15 +311,21 @@ impl ZipArchive {
                 current,
             }
         });
-        Ok(Self {
+        Self {
             src,
             entries,
             meta,
-            comment: end.comment,
+            comment,
             legacy,
             password: opts.password.clone(),
-            data_end: cd_start,
-        })
+            data_end,
+            recovered,
+        }
+    }
+
+    /// True when the central directory was missing or damaged and the entries were found by scanning local headers.
+    pub fn is_recovered(&self) -> bool {
+        self.recovered
     }
 
     /// Present when some names had no encoding information and were decoded by guess or by choice.
@@ -455,6 +503,10 @@ impl Archive for ZipArchive {
 
     fn legacy_names(&self) -> Option<&LegacyNames> {
         self.legacy.as_ref()
+    }
+
+    fn is_recovered(&self) -> bool {
+        self.recovered
     }
 
     fn overlapping_entries(&self) -> usize {
