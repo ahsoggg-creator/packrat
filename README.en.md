@@ -11,7 +11,7 @@ decoder (unrar, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
 
 *All screenshots were taken with made-up data (`Packrat.exe --demo`) — no real file names appear on them.*
 
-## Features (version 0.3.0)
+## Features (version 0.4.0)
 
 - **Formats.** Read and write: ZIP (store, deflate, zstd) and TAR (including `.tar.gz`, `.tar.zst`, `.tar.xz`,
   `.tar.lz4`). Read: 7z (LZMA2, BZip2 and PPMd verified on 7-Zip archives, other methods through the library), single
