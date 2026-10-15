@@ -4,6 +4,7 @@ use crate::archive::{Archive, EntryReader, Kind};
 use crate::codec::stream::{self, Compression};
 use crate::entry::{Entry, EntryKind};
 use crate::error::{Error, Result};
+use crate::options::OpenOptions;
 use crate::sevenz::SevenZArchive;
 use crate::source::{FileSource, SharedSource, SourceReader, read_exact_at};
 use crate::tar::{TarArchive, looks_like_tar};
@@ -13,16 +14,24 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub fn open(path: &Path) -> Result<Box<dyn Archive>> {
+    open_with(path, &OpenOptions::default())
+}
+
+pub fn open_with(path: &Path, opts: &OpenOptions) -> Result<Box<dyn Archive>> {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    open_source(Arc::new(FileSource::open(path)?), &name)
+    open_source_with(Arc::new(FileSource::open(path)?), &name, opts)
+}
+
+pub fn open_source(src: SharedSource, name: &str) -> Result<Box<dyn Archive>> {
+    open_source_with(src, name, &OpenOptions::default())
 }
 
 /// `name` is the archive's file name; it only breaks ties (a `.zip` that has data in front of it) and names
 /// the single entry of a plain `.gz`.
-pub fn open_source(src: SharedSource, name: &str) -> Result<Box<dyn Archive>> {
+pub fn open_source_with(src: SharedSource, name: &str, opts: &OpenOptions) -> Result<Box<dyn Archive>> {
     let mut head = [0u8; 512];
     let n = (src.len().min(512)) as usize;
     read_exact_at(&*src, 0, &mut head[..n])?;
@@ -30,7 +39,7 @@ pub fn open_source(src: SharedSource, name: &str) -> Result<Box<dyn Archive>> {
     let lower = name.to_ascii_lowercase();
 
     if head.starts_with(b"PK\x03\x04") || head.starts_with(b"PK\x05\x06") || head.starts_with(b"PK\x07\x08") {
-        return Ok(Box::new(ZipArchive::from_source(src)?));
+        return Ok(Box::new(ZipArchive::from_source_with(src, opts)?));
     }
     if head.starts_with(&[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]) {
         return Ok(Box::new(SevenZArchive::from_source(src)?));
@@ -57,7 +66,7 @@ pub fn open_source(src: SharedSource, name: &str) -> Result<Box<dyn Archive>> {
     }
     if lower.ends_with(".zip") {
         // data in front of the archive (self-extractors) is handled by the ZIP reader itself
-        return Ok(Box::new(ZipArchive::from_source(src)?));
+        return Ok(Box::new(ZipArchive::from_source_with(src, opts)?));
     }
     Err(Error::Unsupported("unknown archive format".into()))
 }
