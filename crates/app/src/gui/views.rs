@@ -175,6 +175,24 @@ impl App {
                         }
                         if has && ui.button(t(Key::CloseArchive)).clicked() {
                             self.loaded = None;
+                            self.preview.clear();
+                        }
+                        let legacy = self
+                            .loaded
+                            .as_ref()
+                            .and_then(|l| l.archive.legacy_names().map(|n| n.current));
+                        if let Some(enc) = legacy
+                            && ui.button(tf(Key::EncodingButton, &[enc.label()])).clicked()
+                        {
+                            self.open_encoding_dialog();
+                        }
+                        if self
+                            .loaded
+                            .as_ref()
+                            .is_some_and(|l| l.has_encrypted() && l.path.is_some())
+                            && ui.button(format!("🔒 {}", t(Key::PasswordEnter))).clicked()
+                        {
+                            self.ask_password_for_open_archive();
                         }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if ui.button(format!("⚙ {}", t(Key::Settings))).clicked() {
@@ -227,6 +245,10 @@ impl App {
                                 "· {}",
                                 tf(Key::StatusSelected, &[&l.selected.len().to_string()])
                             )));
+                        }
+                        if l.uses_zipcrypto() {
+                            ui.label(RichText::new(t(Key::WeakEncryption)).color(p.warn))
+                                .on_hover_text(t(Key::WeakEncryptionHint));
                         }
                     }
                     if let Some((msg, at)) = &self.toast
@@ -284,6 +306,26 @@ impl App {
     pub(super) fn archive_view(&mut self, ui: &mut Ui) {
         let p = theme::PALETTE;
         let sort = self.sort;
+        if self.loaded.is_none() {
+            return;
+        }
+        let mut ask_password = false;
+        egui::Panel::right("preview")
+            .resizable(true)
+            .default_size(380.0)
+            .size_range(260.0..=720.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(p.panel)
+                    .inner_margin(Margin::same(12))
+                    .stroke(egui::Stroke::new(1.0, p.border)),
+            )
+            .show(ui, |ui| {
+                ask_password = super::preview::show(&mut self.preview, ui);
+            });
+        if ask_password {
+            self.ask_password_for_open_archive();
+        }
         let Some(l) = self.loaded.as_ref() else { return };
         let rows = l.tree.visible(&l.expanded, sort);
         let mut actions: Vec<RowAction> = Vec::new();

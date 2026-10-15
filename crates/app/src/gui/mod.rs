@@ -2,6 +2,8 @@
 
 mod dialogs;
 mod jobs;
+mod preview;
+mod secure;
 mod shots;
 pub mod theme;
 mod tree;
@@ -12,7 +14,9 @@ use crate::settings::Settings;
 use crate::{diag, update};
 use eframe::egui::{self, Ui};
 use jobs::{Job, Loaded, Outcome};
+use packrat_core::OpenOptions;
 use packrat_core::create::Format;
+use packrat_core::encoding::NameEncoding;
 use packrat_core::extract::{ExtractOptions, Plan, Resolution};
 use packrat_core::zip::ZipMethod;
 use packrat_core::{codec::stream::Compression, timeutil};
@@ -72,7 +76,38 @@ pub(crate) struct ConflictDialog {
     pub choice: Resolution,
 }
 
+pub(crate) struct EncodingDialog {
+    pub choice: NameEncoding,
+}
+
+/// What to continue with once the password has opened the archive.
+pub(crate) enum AfterOpen {
+    Nothing,
+    Extract {
+        dest: PathBuf,
+        smart: bool,
+        selected_only: bool,
+    },
+}
+
+pub(crate) struct PasswordDialog {
+    pub text: String,
+    pub show: bool,
+    /// A password was tried and did not work.
+    pub wrong: bool,
+    /// The archive that could not be opened.
+    pub path: Option<PathBuf>,
+    pub then: AfterOpen,
+}
+
+pub(crate) struct RiskDialog {
+    pub plan: Box<Plan>,
+    pub opts: Box<ExtractOptions>,
+}
+
 pub(crate) struct CreateDialog {
+    pub password: String,
+    pub encrypt_names: bool,
     pub items: Vec<PathBuf>,
     pub format: usize,
     pub level: u32,
@@ -85,6 +120,8 @@ pub(crate) struct ResultInfo {
     pub lines: Vec<String>,
     pub details: Vec<String>,
     pub folder: Option<PathBuf>,
+    /// Some entries failed because of the password: offer to enter it again.
+    pub wrong_password: bool,
 }
 
 pub(crate) enum UpdateState {
@@ -117,6 +154,13 @@ pub(crate) struct App {
     pub job: Option<Job>,
     pub extract: Option<ExtractDialog>,
     pub conflicts: Option<ConflictDialog>,
+    pub encoding_dialog: Option<EncodingDialog>,
+    pub password_dialog: Option<PasswordDialog>,
+    pub risk_dialog: Option<RiskDialog>,
+    pub preview: preview::PreviewPane,
+    /// Selection and expansion to restore after the archive is reopened (new encoding or password).
+    pub carry: Option<(std::collections::HashSet<usize>, std::collections::HashSet<usize>)>,
+    pub after_open: AfterOpen,
     pub create: Option<CreateDialog>,
     pub result: Option<ResultInfo>,
     pub settings_open: bool,
@@ -157,6 +201,12 @@ impl App {
             job: None,
             extract: None,
             conflicts: None,
+            encoding_dialog: None,
+            password_dialog: None,
+            risk_dialog: None,
+            preview: preview::PreviewPane::default(),
+            carry: None,
+            after_open: AfterOpen::Nothing,
             create: None,
             result: None,
             settings_open: false,
@@ -187,7 +237,7 @@ impl App {
 
     pub fn load_demo(&mut self, ctx: &egui::Context) {
         let (archive, name, len) = crate::demo::archive();
-        let loaded = Loaded::new(archive, None, name, len);
+        let loaded = Loaded::new(archive, None, name, len, OpenOptions::default());
         self.adopt(ctx, loaded);
     }
 
@@ -205,16 +255,37 @@ impl App {
             self.settings.remember(&p.to_string_lossy());
             self.save_settings();
         }
+        let mut loaded = loaded;
+        if let Some((selected, expanded)) = self.carry.take()
+            && let Some(old) = &self.loaded
+            && old.archive.entries().len() == loaded.archive.entries().len()
+        {
+            loaded.selected = selected;
+            loaded.expanded = expanded;
+        }
+        self.preview.clear();
         self.loaded = Some(loaded);
     }
 
     pub fn open_path(&mut self, ctx: &egui::Context, path: PathBuf) {
+        self.open_path_with(ctx, path, OpenOptions::default());
+    }
+
+    pub fn open_path_with(&mut self, ctx: &egui::Context, path: PathBuf, opts: OpenOptions) {
         if self.job.is_some() {
             return;
         }
         self.job = Some(Job::spawn(ctx, t(Key::Working).to_owned(), move |_| {
-            Outcome::Opened(jobs::open_loaded(path))
+            Outcome::Opened(jobs::open_loaded(path, opts))
         }));
+    }
+
+    /// Reopens the archive on screen with different options (a name encoding or a password), keeping the selection.
+    pub fn reopen_with(&mut self, ctx: &egui::Context, opts: OpenOptions) {
+        let Some(l) = &self.loaded else { return };
+        let Some(path) = l.path.clone() else { return };
+        self.carry = Some((l.selected.clone(), l.expanded.clone()));
+        self.open_path_with(ctx, path, opts);
     }
 
     pub fn open_or_create(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
@@ -223,7 +294,7 @@ impl App {
         }
         self.job = Some(Job::spawn(ctx, t(Key::Working).to_owned(), move |_| {
             if paths.len() == 1
-                && let Ok(l) = jobs::open_loaded(paths[0].clone())
+                && let Ok(l) = jobs::open_loaded(paths[0].clone(), OpenOptions::default())
             {
                 return Outcome::Opened(Ok(l));
             }
@@ -313,30 +384,65 @@ impl App {
         let Ok(outcome) = job.rx.try_recv() else { return };
         self.job = None;
         match outcome {
-            Outcome::Opened(Ok(l)) => self.adopt(ctx, *l),
-            Outcome::Opened(Err(e)) => {
-                diag::warn(&format!("open failed: {e}"));
-                self.result = Some(ResultInfo {
-                    ok: false,
-                    lines: vec![tf(Key::ErrorGeneric, &[&e])],
-                    details: vec![],
-                    folder: None,
-                });
+            Outcome::Opened(Ok(l)) => {
+                self.adopt(ctx, *l);
+                let then = std::mem::replace(&mut self.after_open, AfterOpen::Nothing);
+                if let AfterOpen::Extract {
+                    dest,
+                    smart,
+                    selected_only,
+                } = then
+                {
+                    self.start_extract(ctx, dest, smart, selected_only);
+                }
+            }
+            Outcome::Opened(Err(fail)) => {
+                diag::warn(&format!("open failed: {}", fail.message));
+                self.carry = None;
+                if fail.needs_password {
+                    let was_wrong = fail.message.contains("wrong password");
+                    let then = std::mem::replace(&mut self.after_open, AfterOpen::Nothing);
+                    self.password_dialog = Some(PasswordDialog {
+                        text: String::new(),
+                        show: false,
+                        wrong: was_wrong,
+                        path: Some(fail.path),
+                        then,
+                    });
+                } else {
+                    self.after_open = AfterOpen::Nothing;
+                    self.result = Some(ResultInfo {
+                        ok: false,
+                        lines: vec![tf(Key::ErrorGeneric, &[&fail.message])],
+                        details: vec![],
+                        folder: None,
+                        wrong_password: false,
+                    });
+                }
             }
             Outcome::NotAnArchive(paths) => self.begin_create(paths),
             Outcome::Planned { plan, opts } => {
-                if plan.conflicts.is_empty() {
-                    self.run_execute(ctx, *plan, *opts);
+                if !plan.risks.is_empty() && !opts.accept_risks {
+                    self.risk_dialog = Some(RiskDialog { plan, opts });
                 } else {
-                    self.conflicts = Some(ConflictDialog {
-                        plan,
-                        opts,
-                        choice: Resolution::Skip,
-                    });
+                    self.after_risks(ctx, plan, opts);
                 }
             }
             Outcome::Extracted { report, secs, dest } => self.finish_extract(report, secs, dest),
             Outcome::Created { result, output, secs } => self.finish_create(result, output, secs),
+        }
+    }
+
+    /// The plan has no risks (or they were accepted): ask about conflicts, then extract.
+    pub fn after_risks(&mut self, ctx: &egui::Context, plan: Box<Plan>, opts: Box<ExtractOptions>) {
+        if plan.conflicts.is_empty() {
+            self.run_execute(ctx, *plan, *opts);
+        } else {
+            self.conflicts = Some(ConflictDialog {
+                plan,
+                opts,
+                choice: Resolution::Skip,
+            });
         }
     }
 
@@ -400,6 +506,7 @@ impl eframe::App for App {
                 });
             });
 
+        self.pump_preview(&ctx);
         self.dialogs(&ctx);
         self.drop_overlay(&ctx);
         shots::tick(self, &ctx);
@@ -409,6 +516,7 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use packrat_core::Password;
     use packrat_core::create::{CreateOptions, create_archive};
 
     fn wait_for_job(app: &mut App, ctx: &egui::Context) {
@@ -543,5 +651,206 @@ mod tests {
                 .iter()
                 .any(|e| e.path == "data.txt")
         );
+    }
+
+    fn app_with(ctx: &egui::Context, path: PathBuf) -> App {
+        crate::settings::use_test_data_dir();
+        let mut app = App::new(
+            ctx,
+            StartOptions {
+                open: vec![path],
+                demo: false,
+                screenshots: None,
+            },
+        );
+        wait_for_job(&mut app, ctx);
+        app
+    }
+
+    #[test]
+    fn a_bomb_is_not_extracted_until_the_user_accepts_the_risk() {
+        use packrat_core::testkit::{RawEntry, raw_zip};
+        let dir = tempfile::tempdir().unwrap();
+        let zip = dir.path().join("bomb.zip");
+        std::fs::write(
+            &zip,
+            raw_zip(&[RawEntry::file("zeros.bin", vec![0u8; 80 << 20]).deflated()]),
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app_with(&ctx, zip);
+        let dest = dir.path().join("out");
+        std::fs::create_dir(&dest).unwrap();
+        app.start_extract(&ctx, dest.clone(), false, false);
+        wait_for_job(&mut app, &ctx);
+        let risk = app.risk_dialog.take().expect("the warning dialog is shown");
+        assert!(!risk.plan.risks.is_empty());
+        assert!(
+            std::fs::read_dir(&dest).unwrap().next().is_none(),
+            "nothing is written while the dialog is open"
+        );
+
+        // "continue at my own risk"
+        let mut opts = risk.opts;
+        opts.accept_risks = true;
+        app.after_risks(&ctx, risk.plan, opts);
+        wait_for_job(&mut app, &ctx);
+        assert!(app.result.as_ref().is_some_and(|r| r.ok));
+        assert_eq!(std::fs::metadata(dest.join("zeros.bin")).unwrap().len(), 80 << 20);
+    }
+
+    #[test]
+    fn an_encrypted_archive_asks_for_the_password_and_then_extracts() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("vault");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("note.txt"), "top secret").unwrap();
+        let archive = dir.path().join("vault.zip");
+        let mut copts = CreateOptions::new(Format::Zip(ZipMethod::Deflate));
+        copts.password = Some(Password::new("open sesame"));
+        create_archive(&archive, &[src], &copts, &packrat_core::Progress::new()).unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = app_with(&ctx, archive);
+        assert!(app.loaded.as_ref().unwrap().has_encrypted());
+        let dest = dir.path().join("out");
+        std::fs::create_dir(&dest).unwrap();
+        app.start_extract(&ctx, dest.clone(), true, false);
+        assert!(app.job.is_none(), "no work starts before the password is known");
+        let d = app.password_dialog.take().expect("password dialog");
+
+        // the user types the password (what the dialog does on OK)
+        app.after_open = d.then;
+        app.reopen_with(&ctx, OpenOptions::default().with_password("open sesame"));
+        wait_for_job(&mut app, &ctx); // reopen, then the extraction plan starts
+        wait_for_job(&mut app, &ctx); // plan
+        wait_for_job(&mut app, &ctx); // extract
+        assert!(
+            app.result.as_ref().is_some_and(|r| r.ok),
+            "{:?}",
+            app.result.as_ref().map(|r| &r.lines)
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("vault/note.txt")).unwrap(),
+            "top secret"
+        );
+        assert!(app.loaded.as_ref().unwrap().opts.password.is_some());
+    }
+
+    #[test]
+    fn a_wrong_password_is_reported_and_can_be_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("v");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), "x").unwrap();
+        let archive = dir.path().join("v.7z");
+        let mut copts = CreateOptions::new(Format::SevenZ);
+        copts.password = Some(Password::new("right"));
+        create_archive(&archive, &[src], &copts, &packrat_core::Progress::new()).unwrap();
+
+        let ctx = egui::Context::default();
+        crate::settings::use_test_data_dir();
+        let mut app = App::new(
+            &ctx,
+            StartOptions {
+                open: vec![],
+                demo: true,
+                screenshots: None,
+            },
+        );
+        app.demo = false;
+        app.loaded = None;
+        app.open_path(&ctx, archive.clone());
+        wait_for_job(&mut app, &ctx);
+        assert!(app.loaded.is_none());
+        let d = app
+            .password_dialog
+            .take()
+            .expect("the encrypted header asks for a password");
+        assert!(!d.wrong);
+
+        app.open_path_with(&ctx, archive.clone(), OpenOptions::default().with_password("nope"));
+        wait_for_job(&mut app, &ctx);
+        assert!(
+            app.password_dialog.as_ref().is_some_and(|d| d.wrong),
+            "the dialog says the password did not work"
+        );
+
+        app.open_path_with(&ctx, archive, OpenOptions::default().with_password("right"));
+        wait_for_job(&mut app, &ctx);
+        assert!(app.loaded.is_some());
+    }
+
+    #[test]
+    fn choosing_another_name_encoding_reopens_the_archive_and_keeps_the_selection() {
+        use packrat_core::encoding::NameEncoding;
+        use packrat_core::testkit::{RawEntry, raw_zip};
+        let dir = tempfile::tempdir().unwrap();
+        let name = encoding_rs::IBM866.encode("Документы/Отчёт.txt").0.into_owned();
+        let zip = dir.path().join("old.zip");
+        std::fs::write(&zip, raw_zip(&[RawEntry::file(name, "x")])).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app_with(&ctx, zip);
+        let l = app.loaded.as_mut().unwrap();
+        assert_eq!(l.archive.legacy_names().unwrap().current, NameEncoding::Cp866);
+        assert_eq!(l.archive.entries()[0].path, "Документы/Отчёт.txt");
+        l.selected.insert(1);
+
+        app.reopen_with(&ctx, OpenOptions::default().with_encoding(NameEncoding::Win1251));
+        wait_for_job(&mut app, &ctx);
+        let l = app.loaded.as_ref().unwrap();
+        assert_eq!(l.archive.legacy_names().unwrap().current, NameEncoding::Win1251);
+        assert_ne!(l.archive.entries()[0].path, "Документы/Отчёт.txt");
+        assert!(l.selected.contains(&1), "the selection survives the reopen");
+    }
+
+    #[test]
+    fn selecting_one_file_prepares_its_preview_without_extracting() {
+        use packrat_core::testkit::{RawEntry, raw_zip};
+        let dir = tempfile::tempdir().unwrap();
+        let zip = dir.path().join("p.zip");
+        std::fs::write(
+            &zip,
+            raw_zip(&[
+                RawEntry::dir("src/"),
+                RawEntry::file("src/main.rs", "fn main() { let x = 1; }\n").deflated(),
+            ]),
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app_with(&ctx, zip);
+        let node = app
+            .loaded
+            .as_ref()
+            .unwrap()
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.name == "main.rs")
+            .unwrap();
+        app.loaded.as_mut().unwrap().selected.insert(node);
+        for _ in 0..400 {
+            app.pump_preview(&ctx);
+            if app.preview.shown.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let shown = app.preview.shown.as_ref().expect("preview is ready");
+        assert!(matches!(shown.body, preview::Body::Text(_)));
+
+        // two selected files: no preview target
+        let other = app
+            .loaded
+            .as_ref()
+            .unwrap()
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.name == "src")
+            .unwrap();
+        app.loaded.as_mut().unwrap().selected.insert(other);
+        app.pump_preview(&ctx);
+        assert_eq!(app.preview.want, None);
     }
 }

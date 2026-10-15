@@ -1,11 +1,13 @@
 //! Dialog windows and the operations they start.
 
 use super::jobs::{Job, Outcome};
-use super::{App, CreateDialog, ExtractDialog, FORMATS, ResultInfo, UpdateState, theme};
+use super::preview;
+use super::{AfterOpen, App, CreateDialog, ExtractDialog, FORMATS, PasswordDialog, ResultInfo, UpdateState, theme};
 use crate::i18n::{self, Key, Lang, t, tf};
 use crate::installer::{self, Env};
 use crate::{diag, update, winint};
 use eframe::egui::{self, Align2, RichText, Ui, vec2};
+use packrat_core::Password;
 use packrat_core::create::{CreateOptions, CreateReport, create_archive};
 use packrat_core::extract::{self, ExtractOptions, ExtractReport, Plan, Resolution};
 use std::path::{Path, PathBuf};
@@ -73,9 +75,25 @@ impl App {
             return;
         }
         let Some(l) = &self.loaded else { return };
+        if l.has_encrypted() && l.opts.password.is_none() && l.path.is_some() {
+            // the password comes first; the extraction continues once it has opened the archive
+            self.password_dialog = Some(PasswordDialog {
+                text: String::new(),
+                show: false,
+                wrong: false,
+                path: l.path.clone(),
+                then: AfterOpen::Extract {
+                    dest,
+                    smart,
+                    selected_only,
+                },
+            });
+            return;
+        }
         let mut opts = ExtractOptions::new(&dest, l.name.clone());
         opts.smart = smart;
         opts.threads = self.threads();
+        opts.archive_len = l.file_len;
         if selected_only {
             opts.selection = Some(l.tree.entries_under(&l.selected));
         }
@@ -119,6 +137,7 @@ impl App {
                     lines: vec![tf(Key::ErrorGeneric, &[&e])],
                     details: vec![],
                     folder: None,
+                    wrong_password: false,
                 });
             }
             Ok(r) => {
@@ -150,16 +169,24 @@ impl App {
                 if !r.failed.is_empty() {
                     lines.push(tf(Key::FailedEntries, &[&r.failed.len().to_string()]));
                 }
+                if let Some(m) = &r.stopped {
+                    lines.push(tf(Key::StoppedByLimit, &[m]));
+                }
                 let mut details = Vec::new();
                 details.extend(r.blocked.iter().map(|i| format!("⛔ {} — {}", i.path, i.message)));
                 details.extend(r.failed.iter().map(|i| format!("✖ {} — {}", i.path, i.message)));
                 details.extend(r.skipped_existing.iter().map(|p| format!("⏭ {p}")));
                 details.extend(r.kept_both.iter().map(|(a, b)| format!("⧉ {a} → {b}")));
+                let wrong_password = r
+                    .failed
+                    .iter()
+                    .any(|i| i.message.contains("wrong password") || i.message.contains("password"));
                 self.result = Some(ResultInfo {
-                    ok: r.blocked.is_empty() && r.failed.is_empty() && !r.cancelled,
+                    ok: r.blocked.is_empty() && r.failed.is_empty() && !r.cancelled && r.stopped.is_none(),
                     lines,
                     details,
                     folder: Some(dest),
+                    wrong_password,
                 });
             }
         }
@@ -174,6 +201,8 @@ impl App {
                     .position(|(_, n)| *n == self.settings.default_format)
                     .unwrap_or(0);
                 self.create = Some(CreateDialog {
+                    password: String::new(),
+                    encrypt_names: true,
                     items,
                     format,
                     level: self.settings.level.clamp(1, 9),
@@ -200,6 +229,9 @@ impl App {
         let mut opts = CreateOptions::new(Self::format_from_index(c.format));
         opts.level = c.level;
         opts.threads = self.threads();
+        let is_tar = matches!(opts.format, packrat_core::create::Format::Tar(_));
+        opts.password = (!c.password.is_empty() && !is_tar).then(|| Password::new(&c.password));
+        opts.encrypt_names = c.encrypt_names;
         self.settings.default_format = FORMATS[c.format].1.to_owned();
         self.settings.level = c.level;
         self.save_settings();
@@ -229,6 +261,7 @@ impl App {
                     lines: vec![tf(Key::ErrorGeneric, &[&e])],
                     details: vec![],
                     folder: None,
+                    wrong_password: false,
                 });
             }
             Ok(r) => {
@@ -256,6 +289,7 @@ impl App {
                     lines,
                     details,
                     folder: output.parent().map(Path::to_path_buf),
+                    wrong_password: false,
                 });
             }
         }
@@ -263,6 +297,10 @@ impl App {
 
     pub(super) fn dialogs(&mut self, ctx: &egui::Context) {
         self.progress_dialog(ctx);
+        self.risk_dialog_ui(ctx);
+        self.password_dialog_ui(ctx);
+        self.encoding_dialog_ui(ctx);
+        preview::full_window(&mut self.preview, ctx);
         self.extract_dialog(ctx);
         self.conflict_dialog(ctx);
         self.create_dialog(ctx);
@@ -447,6 +485,27 @@ impl App {
                 ui.label(t(Key::CreateLevel));
                 ui.add(egui::Slider::new(&mut c.level, 1..=9));
             });
+            let fmt = Self::format_from_index(c.format);
+            let is_tar = matches!(fmt, packrat_core::create::Format::Tar(_));
+            if is_tar {
+                c.password.clear();
+            }
+            ui.add_enabled_ui(!is_tar, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(t(Key::CreatePassword));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut c.password)
+                            .password(true)
+                            .desired_width(240.0),
+                    );
+                });
+                if matches!(fmt, packrat_core::create::Format::SevenZ) {
+                    ui.checkbox(&mut c.encrypt_names, t(Key::CreateEncryptNames));
+                }
+            });
+            if is_tar {
+                ui.label(theme::dim(t(Key::CreateNoTarPassword)));
+            }
             ui.label(t(Key::CreateName));
             ui.horizontal(|ui| {
                 if ui
@@ -496,6 +555,7 @@ impl App {
         let Some(r) = &self.result else { return };
         let mut close = false;
         let mut open_folder = None;
+        let mut retry_password = false;
         let title = if r.ok { "✔" } else { "⚠" };
         window(title).show(ctx, |ui| {
             ui.set_min_width(480.0);
@@ -526,6 +586,9 @@ impl App {
                 {
                     open_folder = Some(f.clone());
                 }
+                if r.wrong_password && ui.button(t(Key::RetryPassword)).clicked() {
+                    retry_password = true;
+                }
                 if theme::primary(ui, t(Key::Ok)).clicked() {
                     close = true;
                 }
@@ -534,7 +597,10 @@ impl App {
         if let Some(f) = open_folder {
             winint::show_in_explorer(&f);
         }
-        if close {
+        if retry_password {
+            self.result = None;
+            self.ask_password_for_open_archive();
+        } else if close {
             self.result = None;
         }
     }
