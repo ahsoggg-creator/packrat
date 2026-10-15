@@ -3,40 +3,66 @@
 [English](README.en.md) · [Русский](README.md)
 
 An archive manager for Windows (a replacement for 7-Zip + Bandizip + PeaZip): compression and extraction on all
-cores, "smart" extraction without nested `Folder\Folder`, safe handling of untrusted archives, and dragging files
-straight from the window into Explorer. Written in Rust, with no native C compression libraries.
+cores, "smart" extraction without nested `Folder\Folder`, protection against hostile archives, correct names in old
+ZIP files, passwords, and a preview of files right inside the archive. Written in Rust, with no native C compression
+libraries.
 
-![Archive window: tree, sizes, compression ratio](docs/screenshots/02-archive.png)
+![Archive window: tree, sizes, compression ratio and a code preview](docs/screenshots/02-archive-code.png)
 
 *All screenshots were taken with made-up data (`Packrat.exe --demo`) — no real file names appear on them.*
 
-## Features (version 0.1.0)
+## Features (version 0.2.0)
 
 - **Formats.** Read and write: ZIP (store, deflate, zstd) and TAR (including `.tar.gz`, `.tar.zst`, `.tar.xz`,
-  `.tar.lz4`). Read: 7z (no password; LZMA2, BZip2 and PPMd verified on 7-Zip archives, other methods through the library), single `.gz`, `.bz2`, `.xz`, `.zst`,
-  `.lz4` files. Creating 7z (LZMA2) works too. RAR is not supported: the unrar decoder's license forbids bundling it.
-- **All cores.** Compression: ZIP entries and blocks of large files are compressed in parallel (deflate in
-  independent blocks like pigz, zstd and lz4 in independent frames, 7z in parallel LZMA2 blocks, xz in its own
-  blocks). Independent ZIP entries are extracted in parallel. The thread count is configurable (`--threads N`,
-  Settings). Measured speed-ups: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
-- **Smart Extract.** One top-level folder goes straight into the chosen folder (no `Folder\Folder`); a single
-  file lands next to the archive; several loose items go into a new folder named after the archive. `./` entries
-  and folders that differ only by letter case are handled correctly.
-- **Nothing is overwritten without your decision.** Before extracting, Packrat builds a plan and shows which files
-  already exist: "skip" (the default), "replace" or "keep both" (`name (2).txt`).
-- **Path safety.** Entries with `..`, absolute paths, drive letters, UNC paths, reserved names (`CON`, `NUL`,
-  `COM1`…), NTFS alternate streams (`name:stream`, `::$DATA`), trailing dots or spaces are not extracted; they end
-  up in the "blocked" list. Symbolic links from archives are never created, and writing through an existing link
-  or junction is refused.
+  `.tar.lz4`). Read: 7z (LZMA2, BZip2 and PPMd verified on 7-Zip archives, other methods through the library), single
+  `.gz`, `.bz2`, `.xz`, `.zst`, `.lz4` files. Creating 7z (LZMA2) works too. RAR is not supported: the unrar decoder's
+  license forbids bundling it.
+- **All cores.** ZIP entries and blocks of large files are compressed in parallel (deflate in independent blocks
+  like pigz, zstd and lz4 in independent frames, 7z in parallel LZMA2 blocks, xz in its own blocks). Independent ZIP
+  entries are extracted in parallel. The thread count is configurable (`--threads N`, Settings). Measured speed-ups:
+  [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+- **Smart Extract.** One top-level folder goes straight into the chosen folder (no `Folder\Folder`); a single file
+  lands next to the archive; several loose items go into a new folder named after the archive. `./` entries and
+  folders that differ only by letter case are handled correctly.
+- **Nothing is overwritten without your decision.** Before extracting, a plan shows which files already exist: "skip"
+  (the default), "replace" or "keep both" (`name (2).txt`).
+- **Names in old ZIP files.** When an archive has no UTF-8 flag and no Unicode Path field, Packrat detects the name
+  encoding (CP866, Windows-1251, CP437, Shift-JIS, GBK, Big5, EUC-KR) statistically and shows which one it chose. The
+  "Name encoding" button opens a window with a preview of how the names look in any encoding; the choice is applied
+  immediately. On the command line: `--encoding cp866`.
+- **Protection against hostile archives.** Entries with `..`, absolute paths, drive letters, UNC paths, reserved
+  names (`CON`, `NUL`, `COM1`…), NTFS alternate streams (`name:stream`, `::$DATA`), trailing dots or spaces are
+  blocked; symbolic links are never created and writing through an existing link or junction is refused. Before
+  extracting, Packrat checks for signs of an **archive bomb** and warns with "Cancel" / "Continue at my own risk":
+  an excessive expansion ratio (an entry ≥ 250× from 64 MB up, the whole archive ≥ 150× from 1 GB up), more than
+  50 GB in total, over a million entries, not enough free space (with a 256 MB reserve), **overlapping ZIP entries**
+  (shared stored data), archives nested deeper than three levels. When the unpacked size is not known in advance
+  (a bare `.gz` and the like), the limits are enforced while unpacking. No entry can produce more bytes than its
+  header declares.
+- **Passwords.** ZIP: AES-256 (WinZip AE-2) read and write; the old ZipCrypto is read-only and comes with a warning
+  about its weakness. 7z: AES-256, including encrypted file names (read and write). The password is never stored,
+  never logged and never on the command line (CLI: `--ask-password`, `--password-file` or `PACKRAT_PASSWORD`).
+  Compatibility with 7-Zip 26.01 was tested in both directions.
+- **Preview without extracting.** Select a file and its content appears on the right: images (PNG, JPEG, GIF, BMP,
+  WebP) as a thumbnail with a full-size view, text and code with syntax highlighting, a hex view for the rest. For
+  ZIP only the needed entry is read (a test counts the bytes read); for TAR and solid 7z the archive is read up to the
+  file, marked "may be slow", with a limit on how much may be skipped. Preview sizes are capped (text 256 KB, images
+  16 MB, hex 4 KB).
 - **Window.** Content tree (name, size, compression, date, method), sorting, multi-selection, extraction by button
-  or by dragging the selection into Explorer, dropping an archive or files onto the window (opens the archive or
-  offers to create a new one). Russian and English interface.
-- **Command line.** `packrat-cli list | extract | create`, `--smart`, `--threads N`.
-- **Auto-update.** Once a day one request to `api.github.com`; an "Update" button, download, SHA-256 check against
+  or by dragging the selection into Explorer, dropping an archive or files onto the window. Russian and English UI.
+- **Command line.** `packrat-cli list | extract | create`, `--smart`, `--threads N`, `--encoding`, `--accept-risks`,
+  passwords.
+- **Auto-update.** Once a day one request to `api.github.com`; an "Update" button, SHA-256 check against
   `SHA256SUMS.txt`, file replacement and restart; `Packrat.exe --update` does the same without a window. It can be
   turned off in Settings.
 - **Diagnostics, demo.** A log and crash reports in `%APPDATA%\Packrat\logs`; `Packrat.exe --demo` shows the
   program with made-up data.
+
+![Image preview inside an archive](docs/screenshots/03-preview-image.png)
+
+![Choosing the name encoding of an old ZIP](docs/screenshots/04-encoding.png)
+
+![Archive bomb warning](docs/screenshots/05-bomb-warning.png)
 
 ## Install
 
@@ -79,7 +105,7 @@ powershell -ExecutionPolicy Bypass -File scripts\bench.ps1     # speed measureme
 
 Layout:
 
-- `crates/core` — formats, smart extraction, safety checks, tests (no UI);
+- `crates/core` — formats, smart extraction, safety checks, encodings, passwords, preview, tests (no UI);
 - `crates/app` — egui GUI, installer, auto-update, diagnostics, demo mode;
 - `crates/cli` — `packrat-cli`;
 - `scripts/` — release build, measurements, certificate; `docs/` — measurements, release notes, screenshots.
@@ -93,16 +119,23 @@ Packrat.exe --screenshots docs\screenshots
 
 ## Limitations
 
-- RAR is not supported (license). ZIP methods deflate64, bzip2 and LZMA cannot be read; passwords and encryption
-  come in 0.2.0.
-- zstd compression is pure Rust (`ruzstd`) with a single level (about `zstd -1`): fast, but weaker than the official
-  encoder's higher levels.
+- RAR is not supported (license). ZIP methods deflate64, bzip2 and LZMA cannot be read.
+- Encoding detection is statistical and was verified on generated names (Russian in CP866 and CP1251, Japanese,
+  Chinese, Korean); on short or mixed names it can be wrong — then choose the encoding by hand. ZIP only: names in
+  TAR and 7z are read as UTF-8.
+- The bomb thresholds are heuristic: an honest archive with a huge ratio triggers a warning (which you can accept),
+  while a bomb tuned to the thresholds passes without one — but no path can leave the destination folder and no entry
+  can produce more bytes than declared.
+- ZIP AES: AES-256 is verified (what 7-Zip and Packrat write); reading AES-128/192 is implemented but not tested.
+  ZipCrypto passwords are taken as UTF-8; only ASCII was tested. TAR cannot be encrypted.
+- zstd compression is pure Rust (`ruzstd`) with a single level (about `zstd -1`).
 - The listing of `.tar.*` files is built with one pass over the whole archive; for big archives it is not instant.
-- 7z is created with LZMA2 only and without a password. `.tar.lz4` files do not open in stock 7-Zip (it has no LZ4).
+  7z is created with LZMA2 only. `.tar.lz4` files do not open in stock 7-Zip (it has no LZ4).
+- Preview: images over 16 MB and files more than 256 MB into a streaming archive are not shown (extraction is
+  suggested instead). Highlighting uses syntect's default language set.
 - Dragging files from the window into Explorer: the data object is covered by a test, but the mouse gesture itself
   has not been verified automatically on a real system.
-- Name-encoding detection, archive-bomb protection, in-archive file preview, the Explorer menu and file
-  associations arrive in the next versions (0.2.0 and 0.3.0).
+- The Explorer menu, file associations and integrity checks arrive in 0.3.0.
 
 ## License
 
