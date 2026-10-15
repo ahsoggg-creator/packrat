@@ -328,7 +328,11 @@ fn existing_junctions_are_not_written_through() {
         .arg(&outside)
         .output()
         .unwrap();
-    assert!(status.status.success(), "mklink /J failed: {}", String::from_utf8_lossy(&status.stdout));
+    assert!(
+        status.status.success(),
+        "mklink /J failed: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
 
     let zip = raw_zip(&[RawEntry::file("link/evil.txt", "x"), RawEntry::file("fine.txt", "ok")]);
     let a = open_source(Arc::new(MemSource(zip)), "j.zip").unwrap();

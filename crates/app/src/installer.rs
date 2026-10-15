@@ -144,13 +144,15 @@ pub fn uninstall(env: &Env, running_exe: Option<&Path>) -> Result<(), String> {
 fn schedule_dir_removal(dir: &Path) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    // wait for this process to exit, then delete the folder (retrying while the exe is still locked)
+    // Wait for this process to exit, then delete the folder (retrying while the exe is still locked). The whole
+    // script is wrapped in one pair of quotes, which `cmd /C` strips, so the quoted path inside survives.
+    let d = dir.display();
     let script = format!(
-        "ping 127.0.0.1 -n 3 >nul & rmdir /s /q \"{0}\" & if exist \"{0}\" (ping 127.0.0.1 -n 4 >nul & rmdir /s /q \"{0}\")",
-        dir.display()
+        "\"ping 127.0.0.1 -n 3 >nul & rmdir /s /q \"{d}\" & if exist \"{d}\" (ping 127.0.0.1 -n 4 >nul & rmdir /s /q \"{d}\")\""
     );
     let _ = std::process::Command::new("cmd.exe")
-        .args(["/C", &script])
+        .arg("/C")
+        .raw_arg(script)
         .creation_flags(CREATE_NO_WINDOW)
         .spawn();
 }

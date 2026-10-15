@@ -153,7 +153,6 @@ strings! {
     ErrorGeneric => ("Ошибка: {0}", "Error: {0}"),
     DropToAdd => ("Отпустите, чтобы добавить в архив", "Release to add to an archive"),
     CrashReportFound => ("В прошлый раз Packrat завершился сбоем. Отчёт: {0}", "Packrat crashed last time. Report: {0}"),
-    ContextMenuHint => ("Правый клик по архиву → Показать дополнительные параметры → Packrat", "Right-click an archive → Show more options → Packrat"),
     Expand => ("Развернуть всё", "Expand all"),
     Collapse => ("Свернуть всё", "Collapse all"),
     DragTooLarge => ("Для перетаскивания слишком много данных (больше {0}): используйте «Распаковать»", "Too much data to drag out (over {0}): use Extract"),

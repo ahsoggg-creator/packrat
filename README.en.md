@@ -13,7 +13,7 @@ straight from the window into Explorer. Written in Rust, with no native C compre
 ## Features (version 0.1.0)
 
 - **Formats.** Read and write: ZIP (store, deflate, zstd) and TAR (including `.tar.gz`, `.tar.zst`, `.tar.xz`,
-  `.tar.lz4`). Read: 7z (LZMA, LZMA2, BZip2, PPMd, Deflate, LZ4; no password), single `.gz`, `.bz2`, `.xz`, `.zst`,
+  `.tar.lz4`). Read: 7z (no password; LZMA2, BZip2 and PPMd verified on 7-Zip archives, other methods through the library), single `.gz`, `.bz2`, `.xz`, `.zst`,
   `.lz4` files. Creating 7z (LZMA2) works too. RAR is not supported: the unrar decoder's license forbids bundling it.
 - **All cores.** Compression: ZIP entries and blocks of large files are compressed in parallel (deflate in
   independent blocks like pigz, zstd and lz4 in independent frames, 7z in parallel LZMA2 blocks, xz in its own
