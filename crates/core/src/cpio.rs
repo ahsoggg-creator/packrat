@@ -1,8 +1,8 @@
 //! CPIO archives: the SVR4 "newc" (`070701`, `070702`) and the old portable ASCII ("odc", `070707`) layouts.
 
 use crate::archive::Kind;
-use crate::entry::{Entry, EntryKind};
 use crate::encoding::{NameEncoding, detect};
+use crate::entry::{Entry, EntryKind};
 use crate::error::{Error, Result, corrupt};
 use crate::options::OpenOptions;
 use crate::ranged::{MAX_ENTRIES, RangedArchive};
@@ -79,13 +79,22 @@ pub fn open(src: SharedSource, opts: &OpenOptions) -> Result<RangedArchive> {
         if h[..6] != magic {
             return corrupt("cpio: bad header magic");
         }
-        let Header { mode, mtime, name_len, size } = parse_header(&h, newc)?;
+        let Header {
+            mode,
+            mtime,
+            name_len,
+            size,
+        } = parse_header(&h, newc)?;
         let name_at = pos + header_len;
         let mut raw = vec![0u8; name_len as usize];
         read_exact_at(&*src, name_at, &mut raw)?;
         let name_bytes = raw.split(|&c| c == 0).next().unwrap_or_default().to_vec();
         let name = String::from_utf8_lossy(&name_bytes).into_owned();
-        let data_at = if newc { align(name_at + name_len) } else { name_at + name_len };
+        let data_at = if newc {
+            align(name_at + name_len)
+        } else {
+            name_at + name_len
+        };
         if name == "TRAILER!!!" {
             break;
         }

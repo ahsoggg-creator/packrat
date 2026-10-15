@@ -2,18 +2,18 @@
 
 use crate::archive::{Archive, EntryReader, Kind};
 use crate::cab::CabArchive;
-use crate::cpiostream::CpioStreamArchive;
-use crate::lha::LhaArchive;
-use crate::rar::RarArchive;
-use crate::{ar, cab, cpio, cpiostream, iso, lha, rar};
 use crate::codec::stream::{self, Compression};
+use crate::cpiostream::CpioStreamArchive;
 use crate::entry::{Entry, EntryKind};
 use crate::error::{Error, Result};
+use crate::lha::LhaArchive;
 use crate::options::OpenOptions;
+use crate::rar::RarArchive;
 use crate::sevenz::SevenZArchive;
 use crate::source::{FileSource, SharedSource, SourceReader, read_exact_at};
 use crate::tar::{TarArchive, looks_like_tar};
 use crate::zip::ZipArchive;
+use crate::{ar, cab, cpio, cpiostream, iso, lha, rar};
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;

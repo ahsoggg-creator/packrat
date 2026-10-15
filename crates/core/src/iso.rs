@@ -93,7 +93,16 @@ fn record_time(rec: &[u8]) -> Option<i64> {
         return None;
     }
     let offset = t[6] as i8 as i64 * 15 * 60;
-    Some(unix_from_parts(1900 + t[0] as i64, t[1] as i64, t[2] as i64, t[3] as i64, t[4] as i64, t[5] as i64) - offset)
+    Some(
+        unix_from_parts(
+            1900 + t[0] as i64,
+            t[1] as i64,
+            t[2] as i64,
+            t[3] as i64,
+            t[4] as i64,
+            t[5] as i64,
+        ) - offset,
+    )
 }
 
 pub fn open(src: SharedSource) -> Result<RangedArchive> {
@@ -139,7 +148,11 @@ pub fn open(src: SharedSource) -> Result<RangedArchive> {
                 return Err(Error::Unsupported("too many entries".into()));
             }
             let path = format!("{prefix}{name}");
-            let mut e = Entry::new(items.len(), path.clone(), if is_dir { EntryKind::Dir } else { EntryKind::File });
+            let mut e = Entry::new(
+                items.len(),
+                path.clone(),
+                if is_dir { EntryKind::Dir } else { EntryKind::File },
+            );
             e.mtime = record_time(rec);
             e.method = "stored".into();
             if is_dir {

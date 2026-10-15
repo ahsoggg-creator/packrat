@@ -25,7 +25,11 @@ fn fail(e: impl std::fmt::Display) -> Error {
 }
 
 fn describe(index: usize, h: &delharc::LhaHeader) -> Entry {
-    let kind = if h.is_directory() { EntryKind::Dir } else { EntryKind::File };
+    let kind = if h.is_directory() {
+        EntryKind::Dir
+    } else {
+        EntryKind::File
+    };
     let mut e = Entry::new(index, h.parse_pathname_to_str(), kind);
     e.size = h.original_size;
     e.packed = Some(h.compressed_size);

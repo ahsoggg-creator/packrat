@@ -91,10 +91,7 @@ impl App {
 
     pub(super) fn pick_archive(&mut self, ctx: &egui::Context) {
         let picked = rfd::FileDialog::new()
-            .add_filter(
-                "Archives",
-                &crate::shell::OPEN_EXTS,
-            )
+            .add_filter("Archives", &crate::shell::OPEN_EXTS)
             .add_filter("All files", &["*"])
             .pick_file();
         if let Some(p) = picked {

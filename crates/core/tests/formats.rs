@@ -20,7 +20,11 @@ fn open_bytes(bytes: Vec<u8>, name: &str) -> Box<dyn Archive> {
 }
 
 fn read(a: &dyn Archive, path: &str) -> Vec<u8> {
-    let e = a.entries().iter().find(|e| e.path == path).unwrap_or_else(|| panic!("no {path}"));
+    let e = a
+        .entries()
+        .iter()
+        .find(|e| e.path == path)
+        .unwrap_or_else(|| panic!("no {path}"));
     let mut v = Vec::new();
     a.open_entry(e.index).unwrap().read_to_end(&mut v).unwrap();
     v
@@ -42,7 +46,15 @@ fn check_both(a: &dyn Archive) {
 }
 
 fn ar_member(name: &str, data: &[u8]) -> Vec<u8> {
-    let mut v = format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n", 1_700_000_000, 0, 0, "100644", data.len()).into_bytes();
+    let mut v = format!(
+        "{name:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+        1_700_000_000,
+        0,
+        0,
+        "100644",
+        data.len()
+    )
+    .into_bytes();
     v.extend_from_slice(data);
     if data.len() % 2 == 1 {
         v.push(b'\n');
@@ -57,7 +69,19 @@ fn cpio_newc(files: &[(&str, &[u8])]) -> Vec<u8> {
         n.push(0);
         let h = format!(
             "070701{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}",
-            1, mode, 0, 0, 1, 1_700_000_000u32, data.len(), 0, 0, 0, 0, n.len(), 0
+            1,
+            mode,
+            0,
+            0,
+            1,
+            1_700_000_000u32,
+            data.len(),
+            0,
+            0,
+            0,
+            0,
+            n.len(),
+            0
         );
         out.extend_from_slice(h.as_bytes());
         out.extend_from_slice(&n);
@@ -298,7 +322,9 @@ fn rar_from_a_file_and_not_from_memory() {
     assert!(report.failed.is_empty() && report.blocked.is_empty());
     assert_eq!(fs::read(out.join("x").join("sub").join("b.txt")).unwrap(), big());
 
-    let err = open_source(Arc::new(MemSource(fs::read(&path).unwrap())), "x.rar").map(|_| ()).unwrap_err();
+    let err = open_source(Arc::new(MemSource(fs::read(&path).unwrap())), "x.rar")
+        .map(|_| ())
+        .unwrap_err();
     assert!(matches!(err, Error::Unsupported(_)));
 }
 

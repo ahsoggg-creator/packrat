@@ -84,7 +84,10 @@ impl Archive for CabArchive {
         want: &mut dyn FnMut(&Entry) -> bool,
         visit: &mut dyn FnMut(&Entry, &mut dyn Read) -> Result<()>,
     ) -> Result<()> {
-        let mut cabinet = self.cabinet.lock().map_err(|_| Error::Other("cabinet reader poisoned".into()))?;
+        let mut cabinet = self
+            .cabinet
+            .lock()
+            .map_err(|_| Error::Other("cabinet reader poisoned".into()))?;
         for (e, name) in self.entries.iter().zip(&self.stored_names) {
             if !want(e) {
                 continue;

@@ -133,7 +133,9 @@ pub(crate) fn open_via_walk(a: &dyn Archive, index: usize) -> Result<EntryReader
         Ok(())
     })?;
     if !found {
-        return Err(crate::error::Error::Corrupt("entry disappeared from the archive".into()));
+        return Err(crate::error::Error::Corrupt(
+            "entry disappeared from the archive".into(),
+        ));
     }
     Ok(Box::new(std::io::Cursor::new(data)))
 }

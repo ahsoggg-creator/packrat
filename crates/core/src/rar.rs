@@ -58,9 +58,7 @@ impl RarArchive {
         let pw = password.as_ref().map(|p| p.expose().to_owned());
         let given = password.is_some();
         let first = unrar_archive(&path, &pw).as_first_part();
-        let listing = first
-            .open_for_listing_split()
-            .map_err(|e| map_err(e, given, true))?;
+        let listing = first.open_for_listing_split().map_err(|e| map_err(e, given, true))?;
         let solid = listing.is_solid();
         let mut entries: Vec<Entry> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
@@ -74,7 +72,11 @@ impl RarArchive {
             if entries.len() >= MAX_ENTRIES {
                 return Err(Error::Unsupported("too many entries".into()));
             }
-            let kind = if h.is_directory() { EntryKind::Dir } else { EntryKind::File };
+            let kind = if h.is_directory() {
+                EntryKind::Dir
+            } else {
+                EntryKind::File
+            };
             let mut e = Entry::new(entries.len(), name, kind);
             e.size = h.unpacked_size;
             e.crc32 = (kind == EntryKind::File && h.file_crc != 0).then_some(h.file_crc);
@@ -177,12 +179,10 @@ impl Archive for RarArchive {
                 visit(entry, &mut Cursor::new(data))?;
             } else {
                 let tmp = temp_path();
-                let after = before
-                    .extract_to(&tmp)
-                    .map_err(|e| {
-                        let _ = std::fs::remove_file(&tmp);
-                        map_err(e, given, entry.encrypted)
-                    })?;
+                let after = before.extract_to(&tmp).map_err(|e| {
+                    let _ = std::fs::remove_file(&tmp);
+                    map_err(e, given, entry.encrypted)
+                })?;
                 cursor = after;
                 let mut file = TempFile {
                     file: std::fs::File::open(&tmp)?,

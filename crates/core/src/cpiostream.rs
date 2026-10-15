@@ -29,7 +29,9 @@ type Visitor<'a> = dyn FnMut(&[u8], &Header, &mut dyn Read) -> Result<()> + 'a;
 fn each_member(reader: &mut dyn Read, f: &mut Visitor) -> Result<()> {
     loop {
         let mut magic = [0u8; 6];
-        reader.read_exact(&mut magic).map_err(|_| Error::Corrupt("cpio: stream ends without a trailer".into()))?;
+        reader
+            .read_exact(&mut magic)
+            .map_err(|_| Error::Corrupt("cpio: stream ends without a trailer".into()))?;
         let newc = match &magic {
             b"070701" | b"070702" => true,
             b"070707" => false,
@@ -38,12 +40,19 @@ fn each_member(reader: &mut dyn Read, f: &mut Visitor) -> Result<()> {
         let header_len = if newc { 110 } else { 76 };
         let mut h = vec![0u8; header_len];
         h[..6].copy_from_slice(&magic);
-        reader.read_exact(&mut h[6..]).map_err(|_| Error::Corrupt("cpio: truncated header".into()))?;
+        reader
+            .read_exact(&mut h[6..])
+            .map_err(|_| Error::Corrupt("cpio: truncated header".into()))?;
         let hdr = parse_header(&h, newc)?;
         let mut name = vec![0u8; hdr.name_len as usize];
-        reader.read_exact(&mut name).map_err(|_| Error::Corrupt("cpio: truncated name".into()))?;
+        reader
+            .read_exact(&mut name)
+            .map_err(|_| Error::Corrupt("cpio: truncated name".into()))?;
         let pad = |n: u64| if newc { (4 - n % 4) % 4 } else { 0 };
-        io::copy(&mut (&mut *reader).take(pad(header_len as u64 + hdr.name_len)), &mut io::sink())?;
+        io::copy(
+            &mut (&mut *reader).take(pad(header_len as u64 + hdr.name_len)),
+            &mut io::sink(),
+        )?;
         let name: Vec<u8> = name.split(|&c| c == 0).next().unwrap_or_default().to_vec();
         if name == b"TRAILER!!!" {
             // the checksum of a compressed stream sits after the end marker
@@ -131,8 +140,7 @@ impl CpioStreamArchive {
         let mut pos = 96u64;
         for after_signature in [true, false] {
             let mut h = [0u8; 16];
-            read_exact_at(&*src, pos, &mut h)
-                .map_err(|_| Error::Corrupt("rpm: truncated header".into()))?;
+            read_exact_at(&*src, pos, &mut h).map_err(|_| Error::Corrupt("rpm: truncated header".into()))?;
             if h[..4] != [0x8e, 0xad, 0xe8, 0x01] {
                 return corrupt("rpm: bad header magic");
             }
@@ -186,7 +194,9 @@ impl Archive for CpioStreamArchive {
             if path_of(name).is_none() {
                 return Ok(());
             }
-            let Some(entry) = self.entries.get(next) else { return Ok(()) };
+            let Some(entry) = self.entries.get(next) else {
+                return Ok(());
+            };
             next += 1;
             if want(entry) {
                 visit(entry, data)?;
