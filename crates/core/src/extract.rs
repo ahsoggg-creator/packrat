@@ -49,6 +49,8 @@ pub struct ExtractOptions {
     /// The user saw `Plan::risks` and chose to continue. Without it `execute` refuses to run when there are
     /// risks, and enforces the limits while unpacking.
     pub accept_risks: bool,
+    /// Repair mode: when an entry turns out to be damaged, keep what was decoded as `name.partial`.
+    pub keep_partial: bool,
 }
 
 impl ExtractOptions {
@@ -65,6 +67,7 @@ impl ExtractOptions {
             limits: Limits::default(),
             archive_len: 0,
             accept_risks: false,
+            keep_partial: false,
         }
     }
 }
@@ -116,6 +119,8 @@ pub struct ExtractReport {
     pub cancelled: bool,
     /// Extraction was stopped because a resource limit was reached while unpacking.
     pub stopped: Option<String>,
+    /// Some entries failed only because access was denied: running again as administrator may help.
+    pub needs_admin: bool,
 }
 
 pub fn plan(archive: &dyn Archive, opts: &ExtractOptions) -> Plan {
@@ -287,12 +292,16 @@ fn unique_name(target: &Path) -> PathBuf {
 }
 
 enum Outcome {
-    Written { bytes: u64 },
+    Written {
+        bytes: u64,
+    },
     Skipped(String),
     KeptBoth(String, String),
     Failed(String, String),
     Cancelled,
     Stopped(String),
+    /// Failed because the system refused access.
+    Denied(String, String),
 }
 
 fn write_file(
@@ -308,7 +317,8 @@ fn write_file(
     let fail = |m: String| Outcome::Failed(name.clone(), m);
     let parent = match safepath::ensure_dirs(base, &item.rel[..item.rel.len() - 1]) {
         Ok(p) => p,
-        Err(m) => return fail(m),
+        Err(e) if e.denied => return Outcome::Denied(name, e.message),
+        Err(e) => return fail(e.message),
     };
     let mut target = parent.join(&item.rel[item.rel.len() - 1]);
     let mut kept = None;
@@ -343,6 +353,9 @@ fn write_file(
     progress.set_current(&entry.path);
     let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(&target) {
         Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            return Outcome::Denied(name.clone(), format!("cannot create '{}': {e}", target.display()));
+        }
         Err(e) => return fail(format!("cannot create '{}': {e}", target.display())),
     };
     let mut written = 0u64;
@@ -379,11 +392,39 @@ fn write_file(
         }
         Err(e) => {
             drop(file);
-            let _ = fs::remove_file(&target);
             match Error::from(e) {
-                Error::Cancelled => Outcome::Cancelled,
-                Error::Blocked(m) => Outcome::Stopped(m),
-                other => fail(other.to_string()),
+                Error::Cancelled => {
+                    let _ = fs::remove_file(&target);
+                    Outcome::Cancelled
+                }
+                Error::Blocked(m) => {
+                    let _ = fs::remove_file(&target);
+                    Outcome::Stopped(m)
+                }
+                other if opts.keep_partial && written > 0 => {
+                    // damaged entry: what could be decoded is worth keeping, under a name that says so
+                    let partial = {
+                        let mut os = target.clone().into_os_string();
+                        os.push(".partial");
+                        PathBuf::from(os)
+                    };
+                    let partial = if fs::symlink_metadata(&partial).is_ok() {
+                        unique_name(&partial)
+                    } else {
+                        partial
+                    };
+                    match fs::rename(&target, &partial) {
+                        Ok(()) => fail(format!("{other} — {written} bytes kept as '{}'", partial.display())),
+                        Err(_) => {
+                            let _ = fs::remove_file(&target);
+                            fail(other.to_string())
+                        }
+                    }
+                }
+                other => {
+                    let _ = fs::remove_file(&target);
+                    fail(other.to_string())
+                }
             }
         }
     }
@@ -402,7 +443,20 @@ pub fn execute(
         return Err(Error::Blocked(format!("confirmation is required: {}", list.join("; "))));
     }
     let guard = Guard::new(opts);
-    fs::create_dir_all(&plan.base)?;
+    if let Err(e) = fs::create_dir_all(&plan.base) {
+        if e.kind() == io::ErrorKind::PermissionDenied {
+            // a report instead of an error: the caller can offer to retry with more rights
+            return Ok(ExtractReport {
+                needs_admin: true,
+                failed: vec![Issue {
+                    path: plan.base.display().to_string(),
+                    message: format!("cannot create the folder: {e}"),
+                }],
+                ..Default::default()
+            });
+        }
+        return Err(e.into());
+    }
     let mut report = ExtractReport {
         blocked: plan.blocked.clone(),
         ..Default::default()
@@ -415,10 +469,13 @@ pub fn execute(
     for item in plan.items.iter().filter(|i| i.kind == EntryKind::Dir) {
         match safepath::ensure_dirs(&plan.base, &item.rel) {
             Ok(_) => report.dirs += 1,
-            Err(m) => report.failed.push(Issue {
-                path: archive.entries()[item.index].path.clone(),
-                message: m,
-            }),
+            Err(e) => {
+                report.needs_admin |= e.denied;
+                report.failed.push(Issue {
+                    path: archive.entries()[item.index].path.clone(),
+                    message: e.message,
+                });
+            }
         }
     }
 
@@ -486,6 +543,10 @@ pub fn execute(
             Outcome::Failed(path, message) => report.failed.push(Issue { path, message }),
             Outcome::Cancelled => report.cancelled = true,
             Outcome::Stopped(m) => report.stopped = Some(m),
+            Outcome::Denied(path, message) => {
+                report.needs_admin = true;
+                report.failed.push(Issue { path, message });
+            }
         }
     }
     if progress.is_cancelled() {

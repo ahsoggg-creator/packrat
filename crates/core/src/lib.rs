@@ -22,6 +22,7 @@ pub mod tar;
 #[doc(hidden)]
 pub mod testkit;
 pub mod timeutil;
+pub mod verify;
 pub mod zip;
 
 pub use archive::{Archive, Kind};

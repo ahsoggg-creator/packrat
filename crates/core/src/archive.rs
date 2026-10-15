@@ -56,6 +56,11 @@ pub trait Archive: Send + Sync {
         None
     }
 
+    /// The entry list was rebuilt from local headers because the central directory was unusable.
+    fn is_recovered(&self) -> bool {
+        false
+    }
+
     /// Entries whose stored data overlaps another entry (ZIP only).
     fn overlapping_entries(&self) -> usize {
         0

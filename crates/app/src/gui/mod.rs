@@ -1,5 +1,6 @@
 //! The main window.
 
+mod actions;
 mod dialogs;
 mod jobs;
 mod preview;
@@ -26,10 +27,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use tree::Sort;
 
+/// What the program was asked to do right after it starts (the Explorer menu launches these).
+pub enum StartAction {
+    None,
+    ExtractHere(PathBuf),
+    ExtractTo(PathBuf),
+    Test(PathBuf),
+    Add(Vec<PathBuf>),
+    Quick {
+        format: String,
+        items: Vec<PathBuf>,
+    },
+    /// A job file written by the unprivileged window (see `admin`).
+    Elevated(PathBuf),
+}
+
 pub struct StartOptions {
     pub open: Vec<PathBuf>,
     pub demo: bool,
     pub screenshots: Option<PathBuf>,
+    pub action: StartAction,
 }
 
 pub fn run(opts: StartOptions) -> eframe::Result {
@@ -83,6 +100,10 @@ pub(crate) struct EncodingDialog {
 /// What to continue with once the password has opened the archive.
 pub(crate) enum AfterOpen {
     Nothing,
+    /// Show the "extract to…" dialog.
+    ExtractDialog,
+    /// Check the archive's integrity.
+    Verify,
     Extract {
         dest: PathBuf,
         smart: bool,
@@ -115,6 +136,7 @@ pub(crate) struct CreateDialog {
     pub output_edited: bool,
 }
 
+#[derive(Default)]
 pub(crate) struct ResultInfo {
     pub ok: bool,
     pub lines: Vec<String>,
@@ -122,6 +144,10 @@ pub(crate) struct ResultInfo {
     pub folder: Option<PathBuf>,
     /// Some entries failed because of the password: offer to enter it again.
     pub wrong_password: bool,
+    /// The destination refused access: offer to repeat this extraction with administrator rights.
+    pub admin: Option<crate::admin::Job>,
+    /// The archive could not be opened because its structure is damaged: offer to repair it.
+    pub repair: Option<PathBuf>,
 }
 
 pub(crate) enum UpdateState {
@@ -161,6 +187,12 @@ pub(crate) struct App {
     /// Selection and expansion to restore after the archive is reopened (new encoding or password).
     pub carry: Option<(std::collections::HashSet<usize>, std::collections::HashSet<usize>)>,
     pub after_open: AfterOpen,
+    /// Entry paths to extract (set by an elevated job).
+    pub pending_names: Option<Vec<String>>,
+    pub resolution_override: Option<Resolution>,
+    /// Repair mode: the archive was opened from its local headers and damaged entries are kept as partial files.
+    pub repair_mode: bool,
+    pub last_extract: Option<crate::admin::Job>,
     pub create: Option<CreateDialog>,
     pub result: Option<ResultInfo>,
     pub settings_open: bool,
@@ -207,6 +239,10 @@ impl App {
             preview: preview::PreviewPane::default(),
             carry: None,
             after_open: AfterOpen::Nothing,
+            pending_names: None,
+            resolution_override: None,
+            repair_mode: false,
+            last_extract: None,
             create: None,
             result: None,
             settings_open: false,
@@ -227,12 +263,41 @@ impl App {
             if app.shots.is_none() {
                 app.load_demo(ctx);
             }
+        } else if !matches!(opts.action, StartAction::None) {
+            app.run_action(ctx, opts.action);
         } else if let Some(p) = opts.open.into_iter().next() {
             app.open_path(ctx, p);
         } else if update::due(&app.settings, now_unix()) {
             app.check_updates(ctx, false);
         }
         app
+    }
+
+    /// What the Explorer menu (or an elevated job) asked for.
+    fn run_action(&mut self, ctx: &egui::Context, action: StartAction) {
+        match action {
+            StartAction::None => {}
+            StartAction::ExtractHere(p) => {
+                let dest = p.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+                self.after_open = AfterOpen::Extract {
+                    dest,
+                    smart: true,
+                    selected_only: false,
+                };
+                self.open_path(ctx, p);
+            }
+            StartAction::ExtractTo(p) => {
+                self.after_open = AfterOpen::ExtractDialog;
+                self.open_path(ctx, p);
+            }
+            StartAction::Test(p) => {
+                self.after_open = AfterOpen::Verify;
+                self.open_path(ctx, p);
+            }
+            StartAction::Add(items) => self.begin_create(items),
+            StartAction::Quick { format, items } => self.quick_create(ctx, &format, items),
+            StartAction::Elevated(job_file) => self.start_elevated(ctx, &job_file),
+        }
     }
 
     pub fn load_demo(&mut self, ctx: &egui::Context) {
@@ -379,7 +444,7 @@ impl App {
         }
     }
 
-    fn poll_job(&mut self, ctx: &egui::Context) {
+    pub(crate) fn poll_job(&mut self, ctx: &egui::Context) {
         let Some(job) = &self.job else { return };
         let Ok(outcome) = job.rx.try_recv() else { return };
         self.job = None;
@@ -387,13 +452,15 @@ impl App {
             Outcome::Opened(Ok(l)) => {
                 self.adopt(ctx, *l);
                 let then = std::mem::replace(&mut self.after_open, AfterOpen::Nothing);
-                if let AfterOpen::Extract {
-                    dest,
-                    smart,
-                    selected_only,
-                } = then
-                {
-                    self.start_extract(ctx, dest, smart, selected_only);
+                match then {
+                    AfterOpen::Extract {
+                        dest,
+                        smart,
+                        selected_only,
+                    } => self.start_extract(ctx, dest, smart, selected_only),
+                    AfterOpen::ExtractDialog => self.begin_extract(false),
+                    AfterOpen::Verify => self.start_verify(ctx),
+                    AfterOpen::Nothing => {}
                 }
             }
             Outcome::Opened(Err(fail)) => {
@@ -411,12 +478,15 @@ impl App {
                     });
                 } else {
                     self.after_open = AfterOpen::Nothing;
+                    let repair = fail.can_repair.then(|| fail.path.clone());
                     self.result = Some(ResultInfo {
                         ok: false,
-                        lines: vec![tf(Key::ErrorGeneric, &[&fail.message])],
-                        details: vec![],
-                        folder: None,
-                        wrong_password: false,
+                        lines: vec![tf(Key::ErrorGeneric, &[&fail.message])]
+                            .into_iter()
+                            .chain(repair.iter().map(|_| t(Key::RepairText).to_owned()))
+                            .collect(),
+                        repair,
+                        ..Default::default()
                     });
                 }
             }
@@ -430,6 +500,12 @@ impl App {
             }
             Outcome::Extracted { report, secs, dest } => self.finish_extract(report, secs, dest),
             Outcome::Created { result, output, secs } => self.finish_create(result, output, secs),
+            Outcome::Verified {
+                report,
+                sha256,
+                secs,
+                files,
+            } => self.finish_verify(*report, sha256, secs, files),
         }
     }
 
@@ -558,6 +634,7 @@ mod tests {
                 open: vec![archive],
                 demo: false,
                 screenshots: None,
+                action: StartAction::None,
             },
         );
         wait_for_job(&mut app, &ctx);
@@ -607,6 +684,7 @@ mod tests {
                 open: vec![],
                 demo: true,
                 screenshots: None,
+                action: StartAction::None,
             },
         );
         app.demo = false;
@@ -630,6 +708,7 @@ mod tests {
                 open: vec![],
                 demo: true,
                 screenshots: None,
+                action: StartAction::None,
             },
         );
         app.demo = false;
@@ -661,6 +740,7 @@ mod tests {
                 open: vec![path],
                 demo: false,
                 screenshots: None,
+                action: StartAction::None,
             },
         );
         wait_for_job(&mut app, ctx);
@@ -756,6 +836,7 @@ mod tests {
                 open: vec![],
                 demo: true,
                 screenshots: None,
+                action: StartAction::None,
             },
         );
         app.demo = false;
@@ -852,5 +933,184 @@ mod tests {
         app.loaded.as_mut().unwrap().selected.insert(other);
         app.pump_preview(&ctx);
         assert_eq!(app.preview.want, None);
+    }
+
+    #[test]
+    fn explorer_actions_extract_check_and_compress() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pack");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), "alpha").unwrap();
+        std::fs::write(src.join("sub").join("b.txt"), "beta").unwrap();
+        let ctx = egui::Context::default();
+        crate::settings::use_test_data_dir();
+
+        // "Compress to .tar.zst": no dialog, the archive appears next to the folder
+        let mut app = App::new(
+            &ctx,
+            StartOptions {
+                open: vec![],
+                demo: false,
+                screenshots: None,
+                action: StartAction::Quick {
+                    format: "tar.zst".into(),
+                    items: vec![src.clone()],
+                },
+            },
+        );
+        wait_for_job(&mut app, &ctx);
+        let archive = dir.path().join("pack.tar.zst");
+        assert!(archive.exists(), "the quick archive is created");
+        assert!(app.result.as_ref().is_some_and(|r| r.ok));
+
+        // "Extract here (smart)": into the archive's own folder, without Folder\Folder
+        std::fs::remove_dir_all(&src).unwrap();
+        let mut app = App::new(
+            &ctx,
+            StartOptions {
+                open: vec![],
+                demo: false,
+                screenshots: None,
+                action: StartAction::ExtractHere(archive.clone()),
+            },
+        );
+        for _ in 0..3 {
+            wait_for_job(&mut app, &ctx);
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("pack/sub/b.txt")).unwrap(),
+            "beta"
+        );
+        assert!(!dir.path().join("pack/pack").exists());
+
+        // "Test archive"
+        let mut app = App::new(
+            &ctx,
+            StartOptions {
+                open: vec![],
+                demo: false,
+                screenshots: None,
+                action: StartAction::Test(archive.clone()),
+            },
+        );
+        for _ in 0..2 {
+            wait_for_job(&mut app, &ctx);
+        }
+        let r = app.result.take().expect("the check reports");
+        assert!(
+            r.ok && r.lines.iter().any(|l| l.contains("SHA-256") || l.contains("SHA")),
+            "{:?}",
+            r.lines
+        );
+
+        // "Add to archive…" opens the create dialog with the files
+        let app = App::new(
+            &ctx,
+            StartOptions {
+                open: vec![],
+                demo: false,
+                screenshots: None,
+                action: StartAction::Add(vec![archive]),
+            },
+        );
+        assert_eq!(app.create.as_ref().unwrap().items.len(), 1);
+    }
+
+    #[test]
+    fn an_elevated_job_extracts_what_it_describes() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("docs");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("keep.txt"), "wanted").unwrap();
+        std::fs::write(src.join("skip.txt"), "unwanted").unwrap();
+        let archive = dir.path().join("docs.zip");
+        create_archive(
+            &archive,
+            &[src],
+            &CreateOptions::new(Format::Zip(ZipMethod::Deflate)),
+            &packrat_core::Progress::new(),
+        )
+        .unwrap();
+
+        let dest = dir.path().join("protected-place");
+        std::fs::create_dir(&dest).unwrap();
+        let job = crate::admin::Job {
+            archive,
+            dest: dest.clone(),
+            smart: false,
+            entries: Some(vec!["docs/keep.txt".into()]),
+            resolution: "skip".into(),
+        };
+        let file = crate::admin::write(&job).unwrap();
+        let ctx = egui::Context::default();
+        crate::settings::use_test_data_dir();
+        let mut app = App::new(
+            &ctx,
+            StartOptions {
+                open: vec![],
+                demo: false,
+                screenshots: None,
+                action: StartAction::Elevated(file.clone()),
+            },
+        );
+        for _ in 0..3 {
+            wait_for_job(&mut app, &ctx);
+        }
+        assert!(!file.exists(), "the job file is consumed");
+        assert_eq!(std::fs::read_to_string(dest.join("docs/keep.txt")).unwrap(), "wanted");
+        assert!(
+            !dest.join("docs/skip.txt").exists(),
+            "only the described entries are extracted"
+        );
+    }
+
+    #[test]
+    fn a_damaged_zip_offers_repair_and_the_repair_extracts_what_is_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("d");
+        std::fs::create_dir_all(&src).unwrap();
+        for i in 0..6 {
+            std::fs::write(src.join(format!("f{i}.txt")), format!("file {i} ").repeat(5000)).unwrap();
+        }
+        let whole = dir.path().join("whole.zip");
+        create_archive(
+            &whole,
+            &[src],
+            &CreateOptions::new(Format::Zip(ZipMethod::Deflate)),
+            &packrat_core::Progress::new(),
+        )
+        .unwrap();
+        let bytes = std::fs::read(&whole).unwrap();
+        let cut = dir.path().join("cut.zip");
+        std::fs::write(&cut, &bytes[..bytes.len() * 3 / 4]).unwrap();
+
+        let ctx = egui::Context::default();
+        crate::settings::use_test_data_dir();
+        let mut app = App::new(
+            &ctx,
+            StartOptions {
+                open: vec![],
+                demo: true,
+                screenshots: None,
+                action: StartAction::None,
+            },
+        );
+        app.demo = false;
+        app.loaded = None;
+        app.open_path(&ctx, cut.clone());
+        wait_for_job(&mut app, &ctx);
+        let r = app.result.take().expect("open failed");
+        assert_eq!(r.repair.as_ref(), Some(&cut), "repair is offered");
+
+        app.repair_open(&ctx, cut);
+        wait_for_job(&mut app, &ctx);
+        assert!(app.loaded.as_ref().unwrap().archive.is_recovered());
+        let dest = dir.path().join("out");
+        std::fs::create_dir(&dest).unwrap();
+        app.start_extract(&ctx, dest.clone(), false, false);
+        wait_for_job(&mut app, &ctx);
+        wait_for_job(&mut app, &ctx);
+        let intact = (0..6).filter(|i| dest.join(format!("d/f{i}.txt")).exists()).count();
+        assert!(intact >= 3, "{intact} files recovered");
     }
 }

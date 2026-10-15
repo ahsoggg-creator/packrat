@@ -3,6 +3,7 @@
 use super::tree::Tree;
 use packrat_core::create::CreateReport;
 use packrat_core::extract::{ExtractOptions, ExtractReport, Plan};
+use packrat_core::verify::VerifyReport;
 use packrat_core::{Archive, Error, OpenOptions, Progress, open};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -63,6 +64,8 @@ impl Loaded {
 pub struct OpenFail {
     pub message: String,
     pub needs_password: bool,
+    /// A ZIP whose structure is damaged: rebuilding the list from local headers may still work.
+    pub can_repair: bool,
     pub path: PathBuf,
 }
 
@@ -83,6 +86,12 @@ pub enum Outcome {
         result: Result<CreateReport, String>,
         output: PathBuf,
         secs: f64,
+    },
+    Verified {
+        report: Box<VerifyReport>,
+        sha256: Option<String>,
+        secs: f64,
+        files: u64,
     },
 }
 
@@ -130,8 +139,20 @@ pub fn open_loaded(path: PathBuf, opts: OpenOptions) -> Result<Box<Loaded>, Open
         ))),
         Err(e) => Err(OpenFail {
             needs_password: matches!(e, Error::PasswordRequired | Error::WrongPassword),
+            can_repair: matches!(e, Error::Corrupt(_)) && looks_like_zip(&path),
             message: e.to_string(),
             path,
         }),
     }
+}
+
+fn looks_like_zip(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let by_name = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip"));
+    let mut head = [0u8; 4];
+    let by_magic = std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut head))
+        .is_ok()
+        && &head[..2] == b"PK";
+    by_name || by_magic
 }

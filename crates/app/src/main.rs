@@ -1,5 +1,8 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+mod admin;
+mod args;
+mod batch;
 mod demo;
 mod diag;
 mod dragout;
@@ -13,7 +16,6 @@ mod winint;
 
 use i18n::{Key, t, tf};
 use installer::Env;
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 const HELP: &str = "\
@@ -25,6 +27,8 @@ Packrat — archive manager
   Packrat.exe --install [--silent] install for the current user (also when named *Setup*.exe)
   Packrat.exe --uninstall [--silent]
   Packrat.exe --update             check GitHub for a newer version and replace this file
+  Packrat.exe --extract-here A / --extract-to A / --test A   what the Explorer menu runs
+  Packrat.exe --add F / --quick zip|7z|tar.zst F
   Packrat.exe --version
 ";
 
@@ -64,19 +68,33 @@ fn main() -> ExitCode {
     if installer::is_installed_copy(&Env::real(), &exe) {
         update::cleanup_old(&exe);
     }
-    let screenshots = args
-        .iter()
-        .position(|a| a == "--screenshots")
-        .and_then(|i| args.get(i + 1))
-        .map(PathBuf::from);
+    let parsed = args::parse(&args);
+    // Explorer starts one process per selected file: the first one collects the others and acts for all
+    let action = match parsed.action {
+        gui::StartAction::Add(items) => {
+            match batch::gather(&dragout::temp_root(), "add", items[0].clone(), batch::SETTLE) {
+                Some(all) => gui::StartAction::Add(all),
+                None => return ExitCode::SUCCESS,
+            }
+        }
+        gui::StartAction::Quick { format, items } => {
+            match batch::gather(
+                &dragout::temp_root(),
+                &format!("quick-{format}"),
+                items[0].clone(),
+                batch::SETTLE,
+            ) {
+                Some(all) => gui::StartAction::Quick { format, items: all },
+                None => return ExitCode::SUCCESS,
+            }
+        }
+        other => other,
+    };
     let opts = gui::StartOptions {
-        open: args
-            .iter()
-            .filter(|a| !a.starts_with("--"))
-            .map(PathBuf::from)
-            .collect(),
-        demo: flag(&args, "--demo"),
-        screenshots,
+        open: parsed.open,
+        demo: parsed.demo,
+        screenshots: parsed.screenshots,
+        action,
     };
     dragout::cleanup_stale();
     diag::info(&format!("start {} demo={}", env!("CARGO_PKG_VERSION"), opts.demo));
@@ -108,7 +126,11 @@ fn run_install(exe: &std::path::Path, silent: bool) -> ExitCode {
             if !silent
                 && winint::message_box(
                     t(Key::AppTitle),
-                    &tf(Key::Installed, &[&installed.display().to_string()]),
+                    &format!(
+                        "{}\n\n{}",
+                        tf(Key::Installed, &[&installed.display().to_string()]),
+                        t(Key::ContextMenuHint)
+                    ),
                     true,
                 )
             {
