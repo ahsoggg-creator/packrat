@@ -92,9 +92,23 @@ pub fn sha256_file(path: &Path) -> std::io::Result<String> {
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Short requests (the release information, the checksum file).
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(60)))
+        .user_agent(format!("Packrat/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .into()
+}
+
+/// The download of the program itself: a slow connection must not abort a transfer that is making progress, so only
+/// connecting and the response headers have short limits and the whole transfer gets half an hour.
+fn download_agent() -> ureq::Agent {
+    use std::time::Duration;
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(20)))
+        .timeout_recv_response(Some(Duration::from_secs(60)))
+        .timeout_global(Some(Duration::from_secs(30 * 60)))
         .user_agent(format!("Packrat/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .into()
@@ -119,8 +133,7 @@ pub fn due(settings: &Settings, now: i64) -> bool {
 
 /// Downloads the new exe next to `current`, verifies it against the published checksum, and returns its path.
 pub fn download_verified(rel: &Release, current: &Path, progress: &dyn Fn(u64, u64)) -> Result<PathBuf, String> {
-    let agent = agent();
-    let sums_text = agent
+    let sums_text = agent()
         .get(&rel.sums_url)
         .call()
         .map_err(|e| e.to_string())?
@@ -133,7 +146,7 @@ pub fn download_verified(rel: &Release, current: &Path, progress: &dyn Fn(u64, u
 
     let target = current.with_extension("exe.new");
     let result = (|| -> Result<(), String> {
-        let resp = agent.get(&rel.exe_url).call().map_err(|e| e.to_string())?;
+        let resp = download_agent().get(&rel.exe_url).call().map_err(|e| e.to_string())?;
         let total = resp.body().content_length().unwrap_or(0);
         let mut reader = resp.into_body().into_reader().take(MAX_DOWNLOAD);
         let mut out = fs::File::create(&target).map_err(|e| e.to_string())?;
@@ -283,6 +296,30 @@ mod tests {
         assert_eq!(fs::read(current.with_extension("exe.old")).unwrap(), b"old");
         cleanup_old(&current);
         assert!(!current.with_extension("exe.old").exists());
+    }
+
+    /// Talks to GitHub for real: `cargo test -p packrat-app -- --ignored real_release`.
+    #[test]
+    #[ignore = "needs the network"]
+    fn real_release_downloads_and_verifies() {
+        let rel = parse_release(
+            &ureq::get(format!("https://api.github.com/repos/{REPO}/releases/tags/v0.2.0"))
+                .header("User-Agent", "packrat-test")
+                .call()
+                .unwrap()
+                .body_mut()
+                .read_to_string()
+                .unwrap(),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("Packrat.exe");
+        std::fs::write(&current, b"old").unwrap();
+        let started = std::time::Instant::now();
+        let new = download_verified(&rel, &current, &|_, _| {}).unwrap();
+        eprintln!("downloaded and verified in {:.1} s", started.elapsed().as_secs_f64());
+        apply(&new, &current).unwrap();
+        assert!(std::fs::metadata(&current).unwrap().len() > 1_000_000);
     }
 
     #[test]
