@@ -317,7 +317,7 @@ impl App {
             .frame(
                 egui::Frame::new()
                     .fill(p.panel)
-                    .inner_margin(Margin::same(12))
+                    .inner_margin(Margin::same(16))
                     .stroke(egui::Stroke::new(1.0, p.border)),
             )
             .show(ui, |ui| {

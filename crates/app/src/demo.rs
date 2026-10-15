@@ -67,6 +67,111 @@ pub fn recent_files() -> Vec<String> {
     ]
 }
 
+const MAIN_RS: &str = r#"use zarya::{Config, World};
+
+/// Entry point: load the config, build the world and run until the window closes.
+fn main() -> Result<(), zarya::Error> {
+    let config = Config::load("zarya.toml").unwrap_or_default();
+    let mut world = World::new(config.seed);
+
+    for frame in 0.. {
+        let dt = world.tick();
+        if dt > 0.25 {
+            // a long stall: skip rendering this frame instead of jumping ahead
+            continue;
+        }
+        world.render()?;
+        if world.should_close() || frame > config.max_frames {
+            break;
+        }
+    }
+    println!("{} frames, {} entities", world.frames(), world.entities());
+    Ok(())
+}
+"#;
+
+const LIB_RS: &str = r#"//! Zarya: a tiny scene engine used for the packing demo.
+
+pub mod render;
+
+#[derive(Debug, Default, Clone)]
+pub struct Config {
+    pub seed: u64,
+    pub max_frames: u64,
+    pub vsync: bool,
+}
+
+impl Config {
+    pub fn load(path: &str) -> Result<Config, Error> {
+        let text = std::fs::read_to_string(path).map_err(Error::Io)?;
+        let mut cfg = Config::default();
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            match line.split_once('=') {
+                Some(("seed", v)) => cfg.seed = v.trim().parse().unwrap_or(0),
+                Some(("vsync", v)) => cfg.vsync = v.trim() == "true",
+                _ => {}
+            }
+        }
+        Ok(cfg)
+    }
+}
+
+#[derive(Debug)]
+pub enum Error {
+    Io(std::io::Error),
+    Render(String),
+}
+"#;
+
+/// A smooth colourful picture, encoded as PNG (the demo archive holds real images to preview).
+fn plasma_png(seed: u32) -> Vec<u8> {
+    let (w, h) = (320u32, 200u32);
+    let mut img = image::RgbaImage::new(w, h);
+    let f = seed as f32 * 0.7 + 1.0;
+    for (x, y, p) in img.enumerate_pixels_mut() {
+        let (fx, fy) = (x as f32 / w as f32, y as f32 / h as f32);
+        let v = (fx * 9.0 * f).sin()
+            + (fy * 7.0 + f).sin()
+            + ((fx + fy) * 6.0).sin()
+            + ((fx * fx + fy * fy).sqrt() * 11.0).sin();
+        let r = (128.0 + 127.0 * (v * 0.9 + f).sin()) as u8;
+        let g = (128.0 + 127.0 * (v * 0.9 + f + 2.1).sin()) as u8;
+        let b = (128.0 + 127.0 * (v * 0.9 + f + 4.2).sin()) as u8;
+        *p = image::Rgba([r, g, b, 255]);
+    }
+    let mut out = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .expect("PNG encoding in memory");
+    out
+}
+
+/// A second made-up archive whose names are in CP866, like ZIP files made by old Russian tools.
+pub fn legacy_archive() -> (Arc<dyn Archive>, String, u64) {
+    let enc = |s: &str| encoding_rs::IBM866.encode(s).0.into_owned();
+    let mut r = Lcg(77);
+    let mut e: Vec<RawEntry> = Vec::new();
+    for n in ["Фото отпуск/", "Документы/"] {
+        e.push(RawEntry::dir(enc(n)).dated(2019, 8, 12, 9, 30));
+    }
+    for (n, size) in [
+        ("Фото отпуск/Море на закате.jpg", 90_000usize),
+        ("Фото отпуск/Горы и облака.jpg", 120_000),
+        ("Документы/Договор аренды №5.doc", 24_000),
+        ("Документы/Отчёт за август.xls", 31_000),
+        ("Привет, мир!.txt", 40),
+    ] {
+        e.push(
+            RawEntry::file(enc(n), r.noise(size))
+                .deflated()
+                .dated(2019, 8, 12, 9, 31),
+        );
+    }
+    let bytes = raw_zip(&e);
+    let len = bytes.len() as u64;
+    let zip = ZipArchive::from_source(Arc::new(MemSource(bytes))).expect("demo archive is valid");
+    (Arc::new(zip), "Старый-архив.zip".into(), len)
+}
+
 /// The demo archive, its file name and its (pretend) size on disk.
 pub fn archive() -> (Arc<dyn Archive>, String, u64) {
     let mut r = Lcg(2024);
@@ -87,12 +192,21 @@ pub fn archive() -> (Arc<dyn Archive>, String, u64) {
         .iter()
         .enumerate()
     {
-        e.push(text(
-            &format!("Заря/src/{n}"),
-            1200 + i * 700,
-            &mut r,
-            (2025, 8, 20 + i as u16, 14, 10 + i as u16),
-        ));
+        let date = (2025, 8, 20 + i as u16, 14, 10 + i as u16);
+        let body = match *n {
+            "main.rs" => Some(MAIN_RS),
+            "lib.rs" => Some(LIB_RS),
+            _ => None,
+        };
+        match body {
+            Some(code) => e.push(
+                RawEntry::file(format!("Заря/src/{n}"), code)
+                    .utf8()
+                    .deflated()
+                    .dated(date.0, date.1, date.2, date.3, date.4),
+            ),
+            None => e.push(text(&format!("Заря/src/{n}"), 1200 + i * 700, &mut r, date)),
+        }
     }
     e.push(d("Заря/src/render/"));
     for (i, n) in ["mod.rs", "mesh.rs", "shader.rs", "pipeline.rs"].iter().enumerate() {
@@ -107,7 +221,7 @@ pub fn archive() -> (Arc<dyn Archive>, String, u64) {
     e.push(d("Заря/assets/textures/"));
     for (i, n) in ["grass.png", "stone.png", "water.png", "sky.png"].iter().enumerate() {
         e.push(
-            RawEntry::file(format!("Заря/assets/textures/{n}"), r.noise(38_000 + i * 9_000))
+            RawEntry::file(format!("Заря/assets/textures/{n}"), plasma_png(i as u32 * 3 + 1))
                 .utf8()
                 .deflated()
                 .dated(2025, 7, 11, 16, 2),

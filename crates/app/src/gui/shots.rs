@@ -1,19 +1,26 @@
-//! `Packrat.exe --screenshots <dir>`: walks through a fixed set of scenes with the demo archive and saves
-//! each one as a PNG. Used to regenerate `docs/screenshots`.
+//! `Packrat.exe --screenshots <dir>`: walks through a fixed set of scenes with made-up data and saves each one as
+//! a PNG. Used to regenerate `docs/screenshots`.
 
-use super::{App, CreateDialog, ResultInfo};
+use super::jobs::Loaded;
+use super::{App, ResultInfo, RiskDialog};
 use eframe::egui;
+use packrat_core::OpenOptions;
+use packrat_core::extract::{ExtractOptions, Plan};
+use packrat_core::safety::Risk;
 use std::path::PathBuf;
 
-const SCENES: [&str; 6] = [
+const SCENES: [&str; 9] = [
     "01-welcome",
-    "02-archive",
-    "03-extract",
-    "04-create",
-    "05-settings",
-    "06-result",
+    "02-archive-code",
+    "03-preview-image",
+    "04-encoding",
+    "05-bomb-warning",
+    "06-extract",
+    "07-create",
+    "08-settings",
+    "09-result",
 ];
-const SETTLE_FRAMES: u32 = 6;
+const SETTLE_FRAMES: u32 = 10;
 
 pub struct Runner {
     dir: PathBuf,
@@ -34,46 +41,99 @@ impl Runner {
     }
 }
 
+fn select_by_name(app: &mut App, names: &[&str]) {
+    if let Some(l) = app.loaded.as_mut() {
+        l.expanded = l.tree.dir_ids().collect();
+        l.selected = l
+            .tree
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| names.contains(&n.name.as_str()))
+            .map(|(i, _)| i)
+            .collect();
+    }
+}
+
+fn fake_risks() -> Vec<Risk> {
+    vec![
+        Risk::HighRatio {
+            path: "Заря/assets/video/intro.bin".into(),
+            ratio: 1031.0,
+            size: 4_800_000_000,
+        },
+        Risk::NotEnoughSpace {
+            need: 4_800_000_000,
+            free: 2_100_000_000,
+        },
+        Risk::OverlappingEntries { count: 38 },
+    ]
+}
+
 fn setup(app: &mut App, ctx: &egui::Context, step: usize) {
     app.extract = None;
     app.create = None;
     app.result = None;
+    app.risk_dialog = None;
+    app.encoding_dialog = None;
     app.settings_open = false;
+    app.preview.clear();
     if step == 0 {
         app.loaded = None;
         return;
     }
-    if app.loaded.is_none() {
+    if step != 3 && app.loaded.as_ref().is_none_or(|l| l.name != "Проект-Заря.zip") {
         app.load_demo(ctx);
     }
-    if let Some(l) = app.loaded.as_mut() {
-        l.expanded = l.tree.dir_ids().collect();
-        if step >= 1 {
-            let wanted: Vec<usize> = l
-                .tree
-                .nodes
-                .iter()
-                .enumerate()
-                .filter(|(_, n)| n.name == "changelog.md" || n.name == "guide.md")
-                .map(|(i, _)| i)
-                .collect();
-            l.selected = wanted.into_iter().collect();
-        }
-    }
     match step {
-        2 => app.begin_extract(true),
+        1 => select_by_name(app, &["main.rs"]),
+        2 => select_by_name(app, &["sky.png"]),
         3 => {
+            let (archive, name, len) = crate::demo::legacy_archive();
+            app.loaded = Some(Loaded::new(archive, None, name, len, OpenOptions::default()));
+            select_by_name(app, &[]);
+            app.open_encoding_dialog();
+        }
+        4 => {
+            select_by_name(app, &["README.md"]);
+            let opts = ExtractOptions::new(r"D:\Распаковано", "Проект-Заря.zip");
+            let plan = Plan {
+                base: PathBuf::from(r"D:\Распаковано"),
+                layout: None,
+                items: vec![],
+                blocked: vec![],
+                conflicts: vec![],
+                total_bytes: 4_800_000_000,
+                risks: fake_risks(),
+            };
+            app.risk_dialog = Some(RiskDialog {
+                plan: Box::new(plan),
+                opts: Box::new(opts),
+            });
+        }
+        5 => {
+            select_by_name(app, &["changelog.md", "guide.md"]);
+            app.begin_extract(true);
+        }
+        6 => {
+            select_by_name(app, &["main.rs"]);
             app.begin_create(vec![
                 PathBuf::from(r"D:\Фото\Отпуск-2024"),
                 PathBuf::from(r"D:\Фото\паспорт-скан.jpg"),
                 PathBuf::from(r"D:\Документы\договор.pdf"),
             ]);
-            if let Some(CreateDialog { level, .. }) = app.create.as_mut() {
-                *level = 6;
+            if let Some(c) = app.create.as_mut() {
+                c.level = 6;
+                c.format = 2; // 7z
+                c.password = "пароль-на-архив".into();
             }
         }
-        4 => app.settings_open = true,
-        5 => {
+        7 => {
+            select_by_name(app, &["main.rs"]);
+            app.settings_open = true;
+        }
+        8 => {
+            select_by_name(app, &["main.rs"]);
             app.result = Some(ResultInfo {
                 ok: false,
                 lines: vec![
@@ -106,7 +166,8 @@ pub(super) fn tick(app: &mut App, ctx: &egui::Context) {
         setup(app, ctx, r.step);
     }
     r.frames += 1;
-    if r.frames == SETTLE_FRAMES && !r.requested {
+    // wait until the preview (a worker thread) is ready and its texture has been uploaded
+    if r.frames >= SETTLE_FRAMES && !r.requested && !app.preview.is_loading() && app.job.is_none() {
         ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
         r.requested = true;
     }
