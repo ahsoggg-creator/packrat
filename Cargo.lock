@@ -1808,8 +1808,10 @@ dependencies = [
 name = "packrat-cli"
 version = "0.1.0"
 dependencies = [
+ "encoding_rs",
  "packrat-core",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
