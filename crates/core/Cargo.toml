@@ -7,16 +7,22 @@ repository.workspace = true
 description = "Packrat: archive formats, smart extraction, safety checks (no UI)"
 
 [dependencies]
+aes = "0.9.3"
 bzip2 = "0.6.1"
 chardetng = { version = "1.0.0", default-features = false }
 crc32fast = "1.5.2"
+ctr = "0.10.1"
 encoding_rs = "0.8.42"
 flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
+getrandom = "0.4.3"
+hmac = "0.13.0"
 lz4_flex = { version = "0.14.0", default-features = false, features = ["std", "frame", "safe-encode", "safe-decode", "checked-decode"] }
 lzma-rust2 = "0.22.0"
+pbkdf2 = "0.13.0"
 rayon = "1.12.0"
 ruzstd = "0.9.1"
 sevenz-rust2 = { version = "0.24.0", default-features = false, features = ["aes256", "bzip2", "compress", "deflate", "lz4", "ppmd"] }
+sha1 = "0.11.0"
 tar = { version = "0.4.46", default-features = false }
 
 [dev-dependencies]

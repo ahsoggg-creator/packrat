@@ -83,11 +83,13 @@ fn nothing_hostile_leaves_the_destination_or_fills_the_disk() {
         }),
     ];
 
-    let mut limits = Limits::default();
-    limits.ratio_min_size = 8 << 20;
-    limits.max_ratio = 100.0;
-    limits.total_ratio_min_size = 64 << 20;
-    limits.max_total_ratio = 100.0;
+    let limits = Limits {
+        ratio_min_size: 8 << 20,
+        max_ratio: 100.0,
+        total_ratio_min_size: 64 << 20,
+        max_total_ratio: 100.0,
+        ..Limits::default()
+    };
 
     for (name, bytes) in hostile {
         let outer = tempfile::tempdir().unwrap();

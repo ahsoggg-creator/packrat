@@ -1,6 +1,7 @@
 //! ZIP extra-field helpers.
 
 pub const ID_ZIP64: u16 = 0x0001;
+pub const ID_AES: u16 = 0x9901;
 pub const ID_NTFS: u16 = 0x000a;
 pub const ID_EXT_TIME: u16 = 0x5455;
 pub const ID_UNICODE_PATH: u16 = 0x7075;

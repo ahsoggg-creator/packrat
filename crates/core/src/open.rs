@@ -42,7 +42,7 @@ pub fn open_source_with(src: SharedSource, name: &str, opts: &OpenOptions) -> Re
         return Ok(Box::new(ZipArchive::from_source_with(src, opts)?));
     }
     if head.starts_with(&[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]) {
-        return Ok(Box::new(SevenZArchive::from_source(src)?));
+        return Ok(Box::new(SevenZArchive::from_source_with(src, opts)?));
     }
     if head.starts_with(b"Rar!\x1a\x07") {
         return Err(Error::Unsupported(

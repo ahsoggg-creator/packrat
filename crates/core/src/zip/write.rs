@@ -1,9 +1,11 @@
+use super::crypto::{AES256_STRENGTH, AesWriter};
 use super::{
     METHOD_DEFLATE, METHOD_STORE, METHOD_ZSTD, SIG_CENTRAL, SIG_DESCRIPTOR, SIG_EOCD, SIG_EOCD64, SIG_LOC64, SIG_LOCAL,
 };
 use crate::codec::{deflate, zstd};
 use crate::error::{Error, Result};
 use crate::input::InputItem;
+use crate::options::Password;
 use crate::par::OrderedPool;
 use crate::progress::Progress;
 use crate::source::{FileSource, Source};
@@ -30,6 +32,8 @@ pub struct ZipOptions {
     pub threads: usize,
     /// Files larger than this are cut into blocks that are compressed in parallel.
     pub block_size: usize,
+    /// Encrypt file contents with WinZip AES-256 (names stay readable; ZipCrypto is never written).
+    pub password: Option<Password>,
 }
 
 impl Default for ZipOptions {
@@ -39,6 +43,7 @@ impl Default for ZipOptions {
             level: 6,
             threads: 0,
             block_size: 4 << 20,
+            password: None,
         }
     }
 }
@@ -90,11 +95,14 @@ struct Central {
     offset: u64,
     external: u32,
     is_zip64: bool,
+    /// Set when the data is AES-encrypted: the compression method that is hidden behind method 99.
+    aes_method: Option<u16>,
 }
 
 struct Open {
     central: Central,
     crc: crc32fast::Hasher,
+    aes: Option<AesWriter>,
 }
 
 fn read_block(path: &Path, offset: u64, want: usize) -> Result<Vec<u8>> {
@@ -128,8 +136,21 @@ fn compress(method: ZipMethod, level: u32, raw: Vec<u8>, last: bool, single: boo
     }
 }
 
-fn version_needed(method: u16, zip64: bool) -> u16 {
-    if zip64 {
+/// WinZip AES extra field (AE-2, AES-256).
+fn aes_extra(actual_method: u16) -> Vec<u8> {
+    let mut v = vec![0x01, 0x99, 7, 0, 2, 0, b'A', b'E', AES256_STRENGTH];
+    v.extend(actual_method.to_le_bytes());
+    v
+}
+
+fn stored_method(c: &Central) -> u16 {
+    if c.aes_method.is_some() { 99 } else { c.method }
+}
+
+fn version_needed(method: u16, zip64: bool, aes: bool) -> u16 {
+    if aes {
+        51
+    } else if zip64 {
         45
     } else if method == METHOD_ZSTD {
         63
@@ -150,6 +171,7 @@ fn ext_time_field(mtime: Option<u32>) -> Vec<u8> {
 }
 
 struct Sink<'a, W: Write> {
+    password: Option<Password>,
     w: Counting<W>,
     central: Vec<Central>,
     open: Option<Open>,
@@ -170,6 +192,9 @@ impl<W: Write> Sink<'_, W> {
 
     fn write_local_header(&mut self, c: &Central, descriptor: bool) -> io::Result<()> {
         let mut extra = ext_time_field(c.mtime);
+        if let Some(m) = c.aes_method {
+            extra.extend(aes_extra(m));
+        }
         let (csize32, usize32) = if descriptor && c.is_zip64 {
             extra.extend([1, 0, 16, 0]);
             extra.extend([0u8; 16]);
@@ -182,9 +207,9 @@ impl<W: Write> Sink<'_, W> {
         let flags = c.flags;
         let w = &mut self.w;
         w.write_all(&SIG_LOCAL.to_le_bytes())?;
-        w.write_all(&version_needed(c.method, c.is_zip64).to_le_bytes())?;
+        w.write_all(&version_needed(c.method, c.is_zip64, c.aes_method.is_some()).to_le_bytes())?;
         w.write_all(&flags.to_le_bytes())?;
-        w.write_all(&c.method.to_le_bytes())?;
+        w.write_all(&stored_method(c).to_le_bytes())?;
         w.write_all(&c.time.to_le_bytes())?;
         w.write_all(&c.date.to_le_bytes())?;
         w.write_all(&(if descriptor { 0 } else { c.crc }).to_le_bytes())?;
@@ -206,7 +231,24 @@ impl<W: Write> Sink<'_, W> {
         self.stats.bytes_in += block.raw_len;
         self.stats.bytes_out += block.data.len() as u64;
 
+        let encrypt = self.password.is_some() && !item.is_dir;
+
         if block.count == 1 {
+            let mut data = block.data;
+            let mut crc = block.crc;
+            let mut aes_method = None;
+            let mut flags = flags;
+            if encrypt {
+                let mut aes = AesWriter::new(self.password.as_ref().expect("checked").expose())?;
+                let mut stored = aes.header();
+                aes.encrypt(&mut data);
+                stored.append(&mut data);
+                stored.extend(aes.finish());
+                data = stored;
+                crc = 0; // AE-2: the authentication code protects the data, the CRC field is zero
+                aes_method = Some(block.method);
+                flags |= 1;
+            }
             let c = Central {
                 name: name.into_bytes(),
                 flags,
@@ -214,23 +256,29 @@ impl<W: Write> Sink<'_, W> {
                 time,
                 date,
                 mtime,
-                crc: block.crc,
-                csize: block.data.len() as u64,
+                crc,
+                csize: data.len() as u64,
                 usize: block.raw_len,
                 offset: self.w.pos,
                 external,
                 is_zip64: false,
+                aes_method,
             };
             self.write_local_header(&c, false)?;
-            self.w.write_all(&block.data)?;
+            self.w.write_all(&data)?;
             self.central.push(c);
             return Ok(());
         }
 
         if block.index == 0 {
+            let aes = if encrypt {
+                Some(AesWriter::new(self.password.as_ref().expect("checked").expose())?)
+            } else {
+                None
+            };
             let c = Central {
                 name: name.into_bytes(),
-                flags: flags | 8,
+                flags: flags | 8 | u16::from(aes.is_some()),
                 method: block.method,
                 time,
                 date,
@@ -241,16 +289,28 @@ impl<W: Write> Sink<'_, W> {
                 offset: self.w.pos,
                 external,
                 is_zip64: big,
+                aes_method: aes.as_ref().map(|_| block.method),
             };
             self.write_local_header(&c, true)?;
-            self.open = Some(Open {
+            let mut open = Open {
                 central: c,
                 crc: crc32fast::Hasher::new(),
-            });
+                aes,
+            };
+            if let Some(a) = &open.aes {
+                let h = a.header();
+                self.w.write_all(&h)?;
+                open.central.csize += h.len() as u64;
+            }
+            self.open = Some(open);
         }
         let open = self.open.as_mut().expect("block order is preserved");
-        self.w.write_all(&block.data)?;
-        open.central.csize += block.data.len() as u64;
+        let mut data = block.data;
+        if let Some(a) = open.aes.as_mut() {
+            a.encrypt(&mut data);
+        }
+        self.w.write_all(&data)?;
+        open.central.csize += data.len() as u64;
         open.central.usize += block.raw_len;
         open.crc
             .combine(&crc32fast::Hasher::new_with_initial_len(block.crc, block.raw_len));
@@ -258,6 +318,12 @@ impl<W: Write> Sink<'_, W> {
         if block.index + 1 == block.count {
             let mut open = self.open.take().expect("entry is open");
             open.central.crc = open.crc.finalize();
+            if let Some(a) = open.aes.take() {
+                let tag = a.finish();
+                self.w.write_all(&tag)?;
+                open.central.csize += tag.len() as u64;
+                open.central.crc = 0; // AE-2
+            }
             let c = &open.central;
             self.w.write_all(&SIG_DESCRIPTOR.to_le_bytes())?;
             self.w.write_all(&c.crc.to_le_bytes())?;
@@ -283,6 +349,9 @@ impl<W: Write> Sink<'_, W> {
             let big_sizes = c.csize >= u32::MAX as u64 || c.usize >= u32::MAX as u64;
             let big_offset = c.offset >= u32::MAX as u64;
             let mut extra = ext_time_field(c.mtime);
+            if let Some(m) = c.aes_method {
+                extra.extend(aes_extra(m));
+            }
             let mut z = Vec::new();
             if big_sizes {
                 z.extend(c.usize.to_le_bytes());
@@ -300,9 +369,9 @@ impl<W: Write> Sink<'_, W> {
             let w = &mut self.w;
             w.write_all(&SIG_CENTRAL.to_le_bytes())?;
             w.write_all(&63u16.to_le_bytes())?; // made by: MS-DOS / NTFS family, spec 6.3
-            w.write_all(&version_needed(c.method, zip64).to_le_bytes())?;
+            w.write_all(&version_needed(c.method, zip64, c.aes_method.is_some()).to_le_bytes())?;
             w.write_all(&c.flags.to_le_bytes())?;
-            w.write_all(&c.method.to_le_bytes())?;
+            w.write_all(&stored_method(c).to_le_bytes())?;
             w.write_all(&c.time.to_le_bytes())?;
             w.write_all(&c.date.to_le_bytes())?;
             w.write_all(&c.crc.to_le_bytes())?;
@@ -362,6 +431,7 @@ pub fn write_zip<W: Write>(out: W, items: &[InputItem], opts: &ZipOptions, progr
     let block_size = opts.block_size.max(64 << 10);
     let mut pool = OrderedPool::<Result<Block>>::new(opts.threads)?;
     let mut sink = Sink {
+        password: opts.password.clone(),
         w: Counting { inner: out, pos: 0 },
         central: Vec::with_capacity(items.len()),
         open: None,

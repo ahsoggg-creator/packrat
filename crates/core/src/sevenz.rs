@@ -5,11 +5,12 @@ use crate::archive::{Archive, EntryReader, Kind};
 use crate::entry::{Entry, EntryKind};
 use crate::error::{Error, Result};
 use crate::input::InputItem;
+use crate::options::{OpenOptions, Password as CorePassword};
 use crate::par::OrderedPool;
 use crate::progress::Progress;
 use crate::source::{SharedSource, SourceReader};
 use crate::timeutil;
-use sevenz_rust2::encoder_options::{EncoderOptions, Lzma2Options};
+use sevenz_rust2::encoder_options::{AesEncoderOptions, EncoderOptions, Lzma2Options};
 use sevenz_rust2::{ArchiveEntry, BlockDecoder, EncoderConfiguration, EncoderMethod, NtTime, Password};
 use std::io::{self, Read, Seek, Write};
 use std::sync::Arc;
@@ -17,11 +18,17 @@ use std::sync::Arc;
 const MAX_BUFFERED_ENTRY: u64 = 512 << 20;
 
 fn map_err(e: sevenz_rust2::Error) -> Error {
+    map_err_with(e, false)
+}
+
+/// `had_password`: a password was supplied, so a decryption failure means it is wrong.
+fn map_err_with(e: sevenz_rust2::Error, had_password: bool) -> Error {
     use sevenz_rust2::Error as E;
     match e {
         E::Io(e, _) | E::FileOpen(e, _) => Error::Io(e),
-        E::PasswordRequired => Error::Unsupported("the archive is password protected".into()),
-        E::MaybeBadPassword(_) => Error::Other("wrong password or damaged data".into()),
+        E::PasswordRequired => Error::PasswordRequired,
+        E::MaybeBadPassword(_) if had_password => Error::WrongPassword,
+        E::MaybeBadPassword(_) => Error::PasswordRequired,
         E::UnsupportedCompressionMethod(m) => Error::Unsupported(format!("7z compression method {m}")),
         E::Unsupported(m) => Error::Unsupported(m.into_owned()),
         E::ChecksumVerificationFailed => Error::Integrity("7z checksum mismatch".into()),
@@ -34,6 +41,7 @@ pub struct SevenZArchive {
     archive: sevenz_rust2::Archive,
     entries: Vec<Entry>,
     password: Password,
+    has_password: bool,
 }
 
 fn entry_from(index: usize, f: &ArchiveEntry) -> Entry {
@@ -63,20 +71,39 @@ fn entry_from(index: usize, f: &ArchiveEntry) -> Entry {
 
 impl SevenZArchive {
     pub fn from_source(src: SharedSource) -> Result<Self> {
-        let password = Password::empty();
+        Self::from_source_with(src, &OpenOptions::default())
+    }
+
+    pub fn from_source_with(src: SharedSource, opts: &OpenOptions) -> Result<Self> {
+        let has_password = opts.password.is_some();
+        let password = opts
+            .password
+            .as_ref()
+            .map_or_else(Password::empty, |p| Password::from(p.expose()));
         let mut rd = SourceReader::new(src.clone());
-        let archive = sevenz_rust2::Archive::read(&mut rd, &password).map_err(map_err)?;
-        let entries = archive
+        let archive = sevenz_rust2::Archive::read(&mut rd, &password).map_err(|e| map_err_with(e, has_password))?;
+        let mut entries: Vec<Entry> = archive
             .files
             .iter()
             .enumerate()
             .map(|(i, f)| entry_from(i, f))
             .collect();
+        for (i, block) in archive.stream_map.file_block_index.iter().enumerate() {
+            if let Some(b) = block
+                && archive.blocks[*b]
+                    .coders
+                    .iter()
+                    .any(|c| c.encoder_method_id() == EncoderMethod::ID_AES256_SHA256)
+            {
+                entries[i].encrypted = true;
+            }
+        }
         Ok(Self {
             src,
             archive,
             entries,
             password,
+            has_password,
         })
     }
 
@@ -147,6 +174,8 @@ impl Archive for SevenZArchive {
                 let index = (ae as *const ArchiveEntry as usize - base) / size;
                 let entry = &self.entries[index];
                 if !want(entry) {
+                    // the solid stream must be read through even for entries nobody asked for
+                    io::copy(r, &mut io::sink()).map_err(|e| sevenz_rust2::Error::Io(e, "skipping an entry".into()))?;
                     return Ok(true);
                 }
                 match visit(entry, r) {
@@ -159,7 +188,7 @@ impl Archive for SevenZArchive {
             };
             let finished = BlockDecoder::new(threads, block_index, &self.archive, &self.password, &mut source)
                 .for_each_entries(&mut each)
-                .map_err(map_err)?;
+                .map_err(|e| map_err_with(e, self.has_password))?;
             if !finished {
                 break;
             }
@@ -178,6 +207,10 @@ pub struct SevenZOptions {
     pub threads: usize,
     /// Target size of one solid block; blocks are compressed in parallel.
     pub block_bytes: u64,
+    /// Encrypt the contents with AES-256.
+    pub password: Option<CorePassword>,
+    /// With a password: also encrypt the file names (the header).
+    pub encrypt_names: bool,
 }
 
 impl Default for SevenZOptions {
@@ -186,6 +219,8 @@ impl Default for SevenZOptions {
             level: 5,
             threads: 0,
             block_bytes: 64 << 20,
+            password: None,
+            encrypt_names: true,
         }
     }
 }
@@ -248,12 +283,24 @@ pub fn write_7z<W: Write + Seek>(out: W, items: &[InputItem], opts: &SevenZOptio
     } else {
         Lzma2Options::from_level(level)
     };
-    let methods = Arc::new(vec![
-        EncoderConfiguration::new(EncoderMethod::LZMA2).with_options(EncoderOptions::Lzma2(lzma)),
-    ]);
+    let lzma_conf = EncoderConfiguration::new(EncoderMethod::LZMA2).with_options(EncoderOptions::Lzma2(lzma));
+    // every block gets its own random IV and salt: the chain is AES first, then LZMA2 (as 7-Zip writes it)
+    let chain_for_block = {
+        let (lzma_conf, password) = (lzma_conf.clone(), opts.password.clone());
+        move || -> Arc<Vec<EncoderConfiguration>> {
+            Arc::new(match &password {
+                Some(p) => vec![
+                    AesEncoderOptions::new(Password::from(p.expose())).into(),
+                    lzma_conf.clone(),
+                ],
+                None => vec![lzma_conf.clone()],
+            })
+        }
+    };
 
     let mut writer = sevenz_rust2::ArchiveWriter::new(out).map_err(map_err)?;
-    writer.set_content_methods((*methods).clone());
+    writer.set_content_methods((*chain_for_block()).clone());
+    writer.set_encrypt_header(opts.encrypt_names);
     let mut pool = OrderedPool::<Piece>::new(opts.threads)?;
     let mut deliver = |piece: Piece| -> Result<()> {
         progress.check()?;
@@ -293,9 +340,10 @@ pub fn write_7z<W: Write + Seek>(out: W, items: &[InputItem], opts: &SevenZOptio
             let members: Vec<InputItem> = groups[group_of[i]].iter().map(|&m| items[m].clone()).collect();
             let bytes: u64 = members.iter().map(|m| m.size).sum();
             let files = members.len() as u64;
-            let methods = methods.clone();
+            let chain = chain_for_block.clone();
             pool.submit(
                 move || {
+                    let methods = chain();
                     let entries: Vec<ArchiveEntry> = members.iter().map(entry_for).collect();
                     let readers = members
                         .iter()

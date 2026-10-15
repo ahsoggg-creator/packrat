@@ -3,6 +3,7 @@
 use crate::codec::stream::Compression;
 use crate::error::{Error, Result};
 use crate::input::{self, InputItem, Skipped};
+use crate::options::Password;
 use crate::progress::Progress;
 use crate::sevenz::{self, SevenZOptions};
 use crate::tar;
@@ -57,6 +58,10 @@ pub struct CreateOptions {
     pub level: u32,
     /// 0 = all cores.
     pub threads: usize,
+    /// AES-256 for ZIP and 7z. TAR cannot be encrypted.
+    pub password: Option<Password>,
+    /// 7z only: also encrypt the file names.
+    pub encrypt_names: bool,
 }
 
 impl CreateOptions {
@@ -66,6 +71,8 @@ impl CreateOptions {
             format,
             level,
             threads: 0,
+            password: None,
+            encrypt_names: true,
         }
     }
 }
@@ -130,6 +137,7 @@ fn write_to(output: &Path, items: &[InputItem], opts: &CreateOptions, progress: 
                 method,
                 level: opts.level,
                 threads: opts.threads,
+                password: opts.password.clone(),
                 ..Default::default()
             };
             zip::write_zip(BufWriter::with_capacity(256 << 10, file), items, &zopts, progress)?;
@@ -138,9 +146,16 @@ fn write_to(output: &Path, items: &[InputItem], opts: &CreateOptions, progress: 
             let sopts = SevenZOptions {
                 level: opts.level,
                 threads: opts.threads,
+                password: opts.password.clone(),
+                encrypt_names: opts.encrypt_names,
                 ..Default::default()
             };
             sevenz::write_7z(file, items, &sopts, progress)?;
+        }
+        Format::Tar(_) if opts.password.is_some() => {
+            return Err(Error::Unsupported(
+                "TAR archives cannot be encrypted: use ZIP or 7z".into(),
+            ));
         }
         Format::Tar(c) => {
             let w =
