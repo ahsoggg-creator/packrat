@@ -11,7 +11,7 @@ libraries.
 
 *All screenshots were taken with made-up data (`Packrat.exe --demo`) — no real file names appear on them.*
 
-## Features (version 0.2.0)
+## Features (version 0.3.0)
 
 - **Formats.** Read and write: ZIP (store, deflate, zstd) and TAR (including `.tar.gz`, `.tar.zst`, `.tar.xz`,
   `.tar.lz4`). Read: 7z (LZMA2, BZip2 and PPMd verified on 7-Zip archives, other methods through the library), single
@@ -43,6 +43,8 @@ libraries.
   about its weakness. 7z: AES-256, including encrypted file names (read and write). The password is never stored,
   never logged and never on the command line (CLI: `--ask-password`, `--password-file` or `PACKRAT_PASSWORD`).
   Compatibility with 7-Zip 26.01 was tested in both directions.
+- **Explorer.** A "Packrat" menu for archives (open, extract here, extract to folder, test) and for any file (add to `.zip`, `.7z`, `.tar.zst`, custom name). A multi-selection opens one window with all files. Associations for `.zip`, `.7z`, `.tar` and others are switched on and rolled back in Settings; no administrator rights needed.
+- **Verify and repair.** "Test integrity" (CRC and SHA-256), `packrat-cli test`. A damaged or truncated ZIP is read from its local headers (`extract --repair`); partly extracted files are kept. On "access denied" you can retry as administrator.
 - **Preview without extracting.** Select a file and its content appears on the right: images (PNG, JPEG, GIF, BMP,
   WebP) as a thumbnail with a full-size view, text and code with syntax highlighting, a hex view for the rest. For
   ZIP only the needed entry is read (a test counts the bytes read); for TAR and solid 7z the archive is read up to the
@@ -135,7 +137,7 @@ Packrat.exe --screenshots docs\screenshots
   suggested instead). Highlighting uses syntect's default language set.
 - Dragging files from the window into Explorer: the data object is covered by a test, but the mouse gesture itself
   has not been verified automatically on a real system.
-- The Explorer menu, file associations and integrity checks arrive in 0.3.0.
+- The Explorer menu and associations were checked in an isolated registry hive, not in a live Explorer. Repair of a damaged archive works for ZIP only.
 
 ## License
 
