@@ -18,7 +18,17 @@ pub struct Env {
 }
 
 impl Env {
+    /// The user's real locations. `PACKRAT_SANDBOX=<folder>` redirects everything (files and registry) into that
+    /// folder and a throw-away registry branch, so the installer can be run end to end without touching the system.
     pub fn real() -> Env {
+        if let Some(sandbox) = std::env::var_os("PACKRAT_SANDBOX") {
+            let root = PathBuf::from(sandbox);
+            return Env {
+                install_dir: root.join("Programs").join(APP_NAME),
+                start_menu_dir: root.join("StartMenu"),
+                software_key: r"Software\PackratSandbox".into(),
+            };
+        }
         let local = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);

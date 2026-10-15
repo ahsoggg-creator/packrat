@@ -1,0 +1,136 @@
+﻿{
+    "Machine":  {
+                    "Date":  "2026-10-15",
+                    "Cpu":  "AMD Ryzen 5 7500F 6-Core Processor",
+                    "LogicalCores":  12,
+                    "MemoryGB":  15.6,
+                    "Os":  "Майкрософт Windows 11 Домашняя 10.0.26200",
+                    "DefenderRealTime":  true,
+                    "WorkFolder":  "C:\\Users\\ahsog\\AppData\\Local\\Temp\\packrat-bench",
+                    "DataFiles":  8063,
+                    "DataBytes":  420200102,
+                    "SevenZip":  true,
+                    "AllVerified":  true
+                },
+    "Results":  [
+                    {
+                        "Operation":  "create",
+                        "Name":  "zip deflate, 1 thread",
+                        "Seconds":  7.38,
+                        "Runs":  3,
+                        "ArchiveBytes":  211822677
+                    },
+                    {
+                        "Operation":  "create",
+                        "Name":  "zip deflate, all cores",
+                        "Seconds":  1.62,
+                        "Runs":  3,
+                        "ArchiveBytes":  211822677
+                    },
+                    {
+                        "Operation":  "create",
+                        "Name":  "zip zstd, 1 thread",
+                        "Seconds":  5.51,
+                        "Runs":  3,
+                        "ArchiveBytes":  236643910
+                    },
+                    {
+                        "Operation":  "create",
+                        "Name":  "zip zstd, all cores",
+                        "Seconds":  1.72,
+                        "Runs":  3,
+                        "ArchiveBytes":  236643910
+                    },
+                    {
+                        "Operation":  "create",
+                        "Name":  "tar.zst, 1 thread",
+                        "Seconds":  5.45,
+                        "Runs":  3,
+                        "ArchiveBytes":  238784272
+                    },
+                    {
+                        "Operation":  "create",
+                        "Name":  "tar.zst, all cores",
+                        "Seconds":  1.89,
+                        "Runs":  3,
+                        "ArchiveBytes":  238784272
+                    },
+                    {
+                        "Operation":  "create",
+                        "Name":  "7z LZMA2, 1 thread",
+                        "Seconds":  220.7,
+                        "Runs":  3,
+                        "ArchiveBytes":  180017669
+                    },
+                    {
+                        "Operation":  "create",
+                        "Name":  "7z LZMA2, all cores",
+                        "Seconds":  84.5,
+                        "Runs":  3,
+                        "ArchiveBytes":  180017669
+                    },
+                    {
+                        "Operation":  "create",
+                        "Name":  "7-Zip zip deflate, 1 thread",
+                        "Seconds":  26.52,
+                        "Runs":  3,
+                        "ArchiveBytes":  207520924
+                    },
+                    {
+                        "Operation":  "create",
+                        "Name":  "7-Zip zip deflate, all cores",
+                        "Seconds":  3.9,
+                        "Runs":  3,
+                        "ArchiveBytes":  207520924
+                    },
+                    {
+                        "Operation":  "extract",
+                        "Name":  "extract zip deflate, 1 thread",
+                        "Seconds":  9.15,
+                        "Runs":  3,
+                        "ArchiveBytes":  211822677
+                    },
+                    {
+                        "Operation":  "extract",
+                        "Name":  "extract zip deflate, all cores",
+                        "Seconds":  8.21,
+                        "Runs":  3,
+                        "ArchiveBytes":  211822677
+                    },
+                    {
+                        "Operation":  "extract",
+                        "Name":  "extract zip zstd, 1 thread",
+                        "Seconds":  9.62,
+                        "Runs":  3,
+                        "ArchiveBytes":  236643910
+                    },
+                    {
+                        "Operation":  "extract",
+                        "Name":  "extract zip zstd, all cores",
+                        "Seconds":  7.73,
+                        "Runs":  3,
+                        "ArchiveBytes":  236643910
+                    },
+                    {
+                        "Operation":  "extract",
+                        "Name":  "extract tar.zst (sequential)",
+                        "Seconds":  10.61,
+                        "Runs":  3,
+                        "ArchiveBytes":  238784272
+                    },
+                    {
+                        "Operation":  "extract",
+                        "Name":  "extract 7z",
+                        "Seconds":  11.53,
+                        "Runs":  3,
+                        "ArchiveBytes":  180017669
+                    },
+                    {
+                        "Operation":  "extract",
+                        "Name":  "7-Zip extract zip, all cores",
+                        "Seconds":  7.37,
+                        "Runs":  3,
+                        "ArchiveBytes":  211822677
+                    }
+                ]
+}

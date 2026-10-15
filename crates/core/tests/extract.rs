@@ -312,3 +312,30 @@ fn rar_is_refused_with_a_clear_message() {
         .unwrap();
     assert!(err.to_string().contains("RAR"), "{err}");
 }
+
+/// A junction (or symlink) that already sits in the destination must never be written through.
+#[cfg(windows)]
+#[test]
+fn existing_junctions_are_not_written_through() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("dest");
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&dest).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(dest.join("link"))
+        .arg(&outside)
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "mklink /J failed: {}", String::from_utf8_lossy(&status.stdout));
+
+    let zip = raw_zip(&[RawEntry::file("link/evil.txt", "x"), RawEntry::file("fine.txt", "ok")]);
+    let a = open_source(Arc::new(MemSource(zip)), "j.zip").unwrap();
+    let mut opts = ExtractOptions::new(&dest, "j.zip");
+    opts.smart = false;
+    let report = extract(&*a, &opts, &Progress::new()).unwrap();
+    assert!(!outside.join("evil.txt").exists(), "the junction was followed");
+    assert_eq!(report.failed.len(), 1, "{report:?}");
+    assert_eq!(fs::read_to_string(dest.join("fine.txt")).unwrap(), "ok");
+}
