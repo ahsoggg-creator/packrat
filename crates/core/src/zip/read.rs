@@ -2,9 +2,10 @@ use super::extra;
 use super::{METHOD_DEFLATE, METHOD_STORE, METHOD_ZSTD, SIG_CENTRAL, SIG_EOCD, SIG_EOCD64, SIG_LOC64, SIG_LOCAL};
 use crate::archive::{Archive, EntryReader, Kind};
 use crate::codec::zstd::ZstdReader;
-use crate::encoding::decode_cp437;
+use crate::encoding::{self, Detection, NameEncoding};
 use crate::entry::{Entry, EntryKind};
 use crate::error::{Error, Result, corrupt};
+use crate::options::OpenOptions;
 use crate::source::{FileSource, SharedSource, SourceReader, read_exact_at};
 use crate::timeutil;
 use std::io::{self, BufReader, Read};
@@ -26,6 +27,7 @@ pub struct ZipArchive {
     entries: Vec<Entry>,
     meta: Vec<Meta>,
     comment: Vec<u8>,
+    legacy: Option<LegacyNames>,
     /// Absolute offset of the central directory: entry data must end before it.
     data_end: u64,
 }
@@ -145,16 +147,32 @@ fn find_end_record(src: &dyn crate::source::Source) -> Result<EndRecord> {
     })
 }
 
-fn decode_name(raw: &[u8], flags: u16, extra_data: &[u8]) -> String {
+/// The name as text, or `None` when it is in an unknown legacy code page (no UTF-8 flag, no Unicode Path field,
+/// not valid UTF-8): then the caller decodes it with a detected or user-chosen encoding.
+fn decode_name(raw: &[u8], flags: u16, extra_data: &[u8]) -> Option<String> {
     if let Some(n) = extra::unicode_path(extra_data, raw) {
-        return n;
+        return Some(n);
     }
     if flags & 0x0800 != 0 {
-        return String::from_utf8_lossy(raw).into_owned();
+        return Some(String::from_utf8_lossy(raw).into_owned());
     }
-    match std::str::from_utf8(raw) {
-        Ok(s) => s.to_owned(),
-        Err(_) => decode_cp437(raw),
+    std::str::from_utf8(raw).ok().map(str::to_owned)
+}
+
+/// Names that needed a code page, with what is known about it.
+#[derive(Clone, Debug)]
+pub struct LegacyNames {
+    /// Entry indices that were decoded with `current`.
+    pub indices: Vec<usize>,
+    raw: Vec<Vec<u8>>,
+    pub detection: Detection,
+    pub current: NameEncoding,
+}
+
+impl LegacyNames {
+    /// The first `limit` affected names decoded with `enc`: what the user sees to judge a choice.
+    pub fn preview(&self, enc: NameEncoding, limit: usize) -> Vec<String> {
+        self.raw.iter().take(limit).map(|r| enc.decode(r).0).collect()
     }
 }
 
@@ -176,6 +194,10 @@ impl ZipArchive {
     }
 
     pub fn from_source(src: SharedSource) -> Result<Self> {
+        Self::from_source_with(src, &OpenOptions::default())
+    }
+
+    pub fn from_source_with(src: SharedSource, opts: &OpenOptions) -> Result<Self> {
         let end = find_end_record(&*src)?;
         if end.cd_size > MAX_CENTRAL_DIRECTORY || end.cd_size > src.len() {
             return corrupt("central directory size is not plausible");
@@ -196,18 +218,43 @@ impl ZipArchive {
         let mut cur = Cur { b: &cd, p: 0 };
         let mut entries = Vec::with_capacity(end.entries as usize);
         let mut meta = Vec::with_capacity(end.entries as usize);
+        let mut legacy_idx: Vec<usize> = Vec::new();
         for index in 0..end.entries as usize {
-            let (e, m) = parse_central_entry(&mut cur, index, base)?;
+            let (e, m, is_legacy) = parse_central_entry(&mut cur, index, base)?;
+            if is_legacy {
+                legacy_idx.push(index);
+            }
             entries.push(e);
             meta.push(m);
         }
+        let legacy = (!legacy_idx.is_empty()).then(|| {
+            let raw: Vec<Vec<u8>> = legacy_idx.iter().map(|&i| entries[i].raw_name.clone()).collect();
+            let refs: Vec<&[u8]> = raw.iter().map(Vec::as_slice).collect();
+            let detection = encoding::detect(&refs);
+            let current = opts.encoding.unwrap_or(detection.best);
+            for (&i, r) in legacy_idx.iter().zip(&raw) {
+                entries[i].path = current.decode(r).0;
+            }
+            LegacyNames {
+                indices: legacy_idx,
+                raw,
+                detection,
+                current,
+            }
+        });
         Ok(Self {
             src,
             entries,
             meta,
             comment: end.comment,
+            legacy,
             data_end: cd_start,
         })
+    }
+
+    /// Present when some names had no encoding information and were decoded by guess or by choice.
+    pub fn legacy_names(&self) -> Option<&LegacyNames> {
+        self.legacy.as_ref()
     }
 
     pub fn comment(&self) -> &[u8] {
@@ -238,7 +285,7 @@ impl ZipArchive {
     }
 }
 
-fn parse_central_entry(cur: &mut Cur<'_>, index: usize, base: u64) -> Result<(Entry, Meta)> {
+fn parse_central_entry(cur: &mut Cur<'_>, index: usize, base: u64) -> Result<(Entry, Meta, bool)> {
     if cur.u32()? != SIG_CENTRAL {
         return corrupt("bad central directory entry signature");
     }
@@ -299,7 +346,9 @@ fn parse_central_entry(cur: &mut Cur<'_>, index: usize, base: u64) -> Result<(En
         .or_else(|| extra::ntfs_mtime(extra_data))
         .or_else(|| timeutil::dos_to_naive(ddate, dtime).map(timeutil::local_to_utc));
 
-    let mut e = Entry::new(index, decode_name(raw, flags, extra_data), kind);
+    let decoded = decode_name(raw, flags, extra_data);
+    let is_legacy = decoded.is_none();
+    let mut e = Entry::new(index, decoded.unwrap_or_default(), kind);
     e.raw_name = raw.to_vec();
     e.size = size;
     e.packed = Some(csize);
@@ -319,6 +368,7 @@ fn parse_central_entry(cur: &mut Cur<'_>, index: usize, base: u64) -> Result<(En
             method,
             flags,
         },
+        is_legacy,
     ))
 }
 
@@ -362,6 +412,10 @@ impl<R: Read> Read for Verify<R> {
 impl Archive for ZipArchive {
     fn kind(&self) -> Kind {
         Kind::Zip
+    }
+
+    fn legacy_names(&self) -> Option<&LegacyNames> {
+        self.legacy.as_ref()
     }
 
     fn entries(&self) -> &[Entry] {

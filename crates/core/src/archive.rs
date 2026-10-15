@@ -51,6 +51,11 @@ pub trait Archive: Send + Sync {
     fn kind(&self) -> Kind;
     fn entries(&self) -> &[Entry];
 
+    /// ZIP names that had no encoding information (see `OpenOptions::encoding`).
+    fn legacy_names(&self) -> Option<&crate::zip::read::LegacyNames> {
+        None
+    }
+
     fn random_access(&self) -> bool {
         self.kind().random_access()
     }
