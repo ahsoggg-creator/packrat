@@ -1,6 +1,7 @@
 //! ZIP, written for this project: raw name bytes, Zip64, random access through the central directory,
 //! blocks compressed on worker threads.
 
+pub mod crypto;
 mod extra;
 pub mod read;
 pub mod write;

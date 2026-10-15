@@ -315,7 +315,7 @@ mod tests {
             b'C', b'a', b'f', 0x82, b'/', 0x9a, b'b', b'e', b'r', b'r', b'a', b's', b'c', b'h', b'u', b'n', b'g', b'.',
             b't', b'x', b't',
         ];
-        assert_eq!(detect_owned(&[name.clone()]), NameEncoding::Cp437);
+        assert_eq!(detect_owned(std::slice::from_ref(&name)), NameEncoding::Cp437);
         assert_eq!(NameEncoding::Cp437.decode(&name).0, "Café/Überraschung.txt");
     }
 

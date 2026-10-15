@@ -13,6 +13,9 @@ pub enum Error {
     Integrity(String),
     /// An entry was refused by a safety rule.
     Blocked(String),
+    /// The archive (or an entry) is encrypted and no password was given.
+    PasswordRequired,
+    WrongPassword,
     Cancelled,
     Other(String),
 }
@@ -25,6 +28,8 @@ impl fmt::Display for Error {
             Error::Unsupported(m) => write!(f, "unsupported: {m}"),
             Error::Integrity(m) => write!(f, "integrity check failed: {m}"),
             Error::Blocked(m) => write!(f, "blocked: {m}"),
+            Error::PasswordRequired => f.write_str("a password is required"),
+            Error::WrongPassword => f.write_str("wrong password"),
             Error::Cancelled => f.write_str("cancelled"),
             Error::Other(m) => f.write_str(m),
         }

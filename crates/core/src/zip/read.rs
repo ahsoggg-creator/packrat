@@ -1,3 +1,5 @@
+use super::crypto::aes_key_len;
+use super::crypto::{AesReader, ZipCryptoReader};
 use super::extra;
 use super::{METHOD_DEFLATE, METHOD_STORE, METHOD_ZSTD, SIG_CENTRAL, SIG_EOCD, SIG_EOCD64, SIG_LOC64, SIG_LOCAL};
 use crate::archive::{Archive, EntryReader, Kind};
@@ -5,7 +7,7 @@ use crate::codec::zstd::ZstdReader;
 use crate::encoding::{self, Detection, NameEncoding};
 use crate::entry::{Entry, EntryKind};
 use crate::error::{Error, Result, corrupt};
-use crate::options::OpenOptions;
+use crate::options::{OpenOptions, Password};
 use crate::source::{FileSource, SharedSource, SourceReader, read_exact_at};
 use crate::timeutil;
 use std::io::{self, BufReader, Read};
@@ -20,6 +22,18 @@ pub(crate) struct Meta {
     pub csize: u64,
     pub method: u16,
     pub flags: u16,
+    /// MS-DOS time of the entry (its high byte is the ZipCrypto check byte when a data descriptor is used).
+    pub dos_time: u16,
+    pub aes: Option<AesInfo>,
+}
+
+/// The WinZip AES extra field (0x9901).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AesInfo {
+    /// 1 = AE-1 (CRC kept), 2 = AE-2 (CRC is zero, the authentication code protects the data).
+    pub version: u16,
+    pub strength: u8,
+    pub actual_method: u16,
 }
 
 pub struct ZipArchive {
@@ -28,6 +42,7 @@ pub struct ZipArchive {
     meta: Vec<Meta>,
     comment: Vec<u8>,
     legacy: Option<LegacyNames>,
+    password: Option<Password>,
     /// Absolute offset of the central directory: entry data must end before it.
     data_end: u64,
 }
@@ -176,6 +191,18 @@ impl LegacyNames {
     }
 }
 
+fn parse_aes_extra(extra_data: &[u8]) -> Option<AesInfo> {
+    let d = extra::find(extra_data, extra::ID_AES)?;
+    if d.len() < 7 || &d[2..4] != b"AE" {
+        return None;
+    }
+    Some(AesInfo {
+        version: u16::from_le_bytes([d[0], d[1]]),
+        strength: d[4],
+        actual_method: u16::from_le_bytes([d[5], d[6]]),
+    })
+}
+
 fn method_label(method: u16) -> String {
     match method {
         METHOD_STORE => "Store".into(),
@@ -248,6 +275,7 @@ impl ZipArchive {
             meta,
             comment: end.comment,
             legacy,
+            password: opts.password.clone(),
             data_end: cd_start,
         })
     }
@@ -353,9 +381,18 @@ fn parse_central_entry(cur: &mut Cur<'_>, index: usize, base: u64) -> Result<(En
     e.size = size;
     e.packed = Some(csize);
     e.mtime = mtime;
-    e.crc32 = Some(crc);
+    let aes = (method == 99).then(|| parse_aes_extra(extra_data)).flatten();
+    e.crc32 = aes.is_none_or(|a| a.version == 1).then_some(crc);
     e.encrypted = flags & 1 != 0;
-    e.method = method_label(method);
+    e.method = match aes {
+        Some(a) => format!(
+            "AES-{} {}",
+            aes_key_len(a.strength).unwrap_or(0) * 8,
+            method_label(a.actual_method)
+        ),
+        None if flags & 1 != 0 => format!("ZipCrypto {}", method_label(method)),
+        None => method_label(method),
+    };
     e.mode = unix_mode;
     let local_offset = loff
         .checked_add(base)
@@ -367,6 +404,8 @@ fn parse_central_entry(cur: &mut Cur<'_>, index: usize, base: u64) -> Result<(En
             csize,
             method,
             flags,
+            dos_time: dtime,
+            aes,
         },
         is_legacy,
     ))
@@ -455,13 +494,31 @@ impl Archive for ZipArchive {
             .get(index)
             .ok_or_else(|| Error::Other(format!("no entry #{index}")))?;
         let m = &self.meta[index];
-        if e.encrypted || m.flags & 1 != 0 || m.method == 99 {
-            return Err(Error::Unsupported(format!("'{}' is encrypted", e.path)));
-        }
+        let encrypted = m.flags & 1 != 0 || m.method == 99;
         let start = self.data_start(index)?;
-        let raw = SourceReader::window(self.src.clone(), start, m.csize);
-        let decoded: EntryReader<'_> = match m.method {
-            METHOD_STORE => Box::new(raw),
+        let window = SourceReader::window(self.src.clone(), start, m.csize);
+        let mut method = m.method;
+        let raw: EntryReader<'_> = if !encrypted {
+            Box::new(window)
+        } else {
+            let password = self.password.as_ref().ok_or(Error::PasswordRequired)?;
+            if let Some(aes) = m.aes {
+                method = aes.actual_method;
+                Box::new(AesReader::new(window, m.csize, aes.strength, password.expose())?)
+            } else if m.method == 99 {
+                return Err(Error::Corrupt(format!("'{}' has no AES information", e.path)));
+            } else {
+                // the check byte: high byte of the CRC, or of the DOS time when a data descriptor follows the data
+                let check = if m.flags & 8 != 0 {
+                    (m.dos_time >> 8) as u8
+                } else {
+                    (e.crc32.unwrap_or(0) >> 24) as u8
+                };
+                Box::new(ZipCryptoReader::new(window, password.expose(), check)?)
+            }
+        };
+        let decoded: EntryReader<'_> = match method {
+            METHOD_STORE => raw,
             METHOD_DEFLATE => Box::new(flate2::read::DeflateDecoder::new(BufReader::with_capacity(
                 64 << 10,
                 raw,

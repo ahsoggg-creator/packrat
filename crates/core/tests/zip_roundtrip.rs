@@ -57,6 +57,7 @@ fn roundtrip_all_methods_and_thread_counts() {
                 level: 6,
                 threads,
                 block_size: 64 << 10,
+                password: None,
             };
             let mut buf = Vec::new();
             let stats = write_zip(&mut buf, &items, &opts, &Progress::new()).unwrap();
