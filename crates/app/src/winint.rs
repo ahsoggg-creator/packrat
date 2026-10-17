@@ -42,6 +42,46 @@ mod imp {
         }
     }
 
+    /// Moves a file to the Recycle Bin (no prompts).
+    pub fn recycle(path: &Path) -> Result<(), String> {
+        use windows::Win32::UI::Shell::{
+            FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING,
+            SHFILEOPSTRUCTW, SHFileOperationW,
+        };
+        if !path.is_absolute() {
+            return Err("not an absolute path".into());
+        }
+        // the list of names ends with an extra NUL
+        let from: Vec<u16> = path
+            .as_os_str()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain([0, 0])
+            .collect();
+        let mut op = SHFILEOPSTRUCTW {
+            wFunc: FO_DELETE,
+            pFrom: PCWSTR(from.as_ptr()),
+            fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT | FOF_WANTNUKEWARNING).0 as u16,
+            ..Default::default()
+        };
+        // SAFETY: `from` is NUL-terminated twice and outlives the call.
+        let code = unsafe { SHFileOperationW(&mut op) };
+        if code != 0 || op.fAnyOperationsAborted.as_bool() {
+            return Err(format!("code {code:#x}"));
+        }
+        Ok(())
+    }
+
+    /// Ends Explorer; Windows starts the shell again by itself.
+    pub fn restart_explorer() {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/f", "/im", "explorer.exe"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
+
     #[cfg(test)]
     pub fn read_shortcut_target(lnk: &Path) -> Option<String> {
         use windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW;
@@ -129,6 +169,12 @@ mod imp {
         Err("shortcuts are only available on Windows".into())
     }
 
+    pub fn recycle(_: &Path) -> Result<(), String> {
+        Err("the Recycle Bin is only available on Windows".into())
+    }
+
+    pub fn restart_explorer() {}
+
     #[cfg(test)]
     pub fn read_shortcut_target(_: &Path) -> Option<String> {
         None
@@ -159,6 +205,15 @@ pub fn read_shortcut_target(lnk: &Path) -> Option<String> {
     imp::read_shortcut_target(lnk)
 }
 
+/// Moves a file to the Recycle Bin, so that a mistake can be undone.
+pub fn recycle(path: &Path) -> Result<(), String> {
+    imp::recycle(path)
+}
+
+pub fn restart_explorer() {
+    imp::restart_explorer()
+}
+
 pub fn console_print(text: &str) {
     imp::console_print(text)
 }
@@ -175,4 +230,19 @@ pub fn run_elevated(exe: &Path, args: &str) -> Result<(), String> {
 /// Native message box; returns false only when a Yes/No box was answered "No".
 pub fn message_box(title: &str, text: &str, yes_no: bool) -> bool {
     imp::message_box(title, text, yes_no)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recycle_removes_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("packrat-recycle-test.txt");
+        std::fs::write(&f, b"x").unwrap();
+        recycle(&f).unwrap();
+        assert!(!f.exists());
+        assert!(recycle(&dir.path().join("missing.txt")).is_err() || !dir.path().join("missing.txt").exists());
+    }
 }

@@ -11,7 +11,7 @@ decoder (unrar, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
 
 *All screenshots were taken with made-up data (`Packrat.exe --demo`) — no real file names appear on them.*
 
-## Features (version 0.4.0)
+## Features (version 0.5.0)
 
 - **Formats.** Read and write: ZIP (store, deflate, zstd) and TAR (including `.tar.gz`, `.tar.zst`, `.tar.xz`,
   `.tar.lz4`). Read: 7z (LZMA2, BZip2 and PPMd verified on 7-Zip archives, other methods through the library), single
@@ -26,6 +26,7 @@ decoder (unrar, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
 - **Smart Extract.** One top-level folder goes straight into the chosen folder (no `Folder\Folder`); a single file
   lands next to the archive; several loose items go into a new folder named after the archive. `./` entries and
   folders that differ only by letter case are handled correctly.
+- **Convenient extraction from Explorer.** “Extract here” opens a compact progress window, then opens the folder and closes by itself; if something goes wrong the window stays with a report. Settings and the “Extract to…” window can move the archive to the Recycle Bin after a complete clean extraction (off by default; skipped files or errors keep the archive).
 - **Nothing is overwritten without your decision.** Before extracting, a plan shows which files already exist: "skip"
   (the default), "replace" or "keep both" (`name (2).txt`).
 - **Names in old ZIP files.** When an archive has no UTF-8 flag and no Unicode Path field, Packrat detects the name
@@ -45,7 +46,7 @@ decoder (unrar, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
   about its weakness. 7z: AES-256, including encrypted file names (read and write). The password is never stored,
   never logged and never on the command line (CLI: `--ask-password`, `--password-file` or `PACKRAT_PASSWORD`).
   Compatibility with 7-Zip 26.01 was tested in both directions.
-- **Explorer.** A "Packrat" menu for archives (open, extract here, extract to folder, test) and for any file (add to `.zip`, `.7z`, `.tar.zst`, custom name). A multi-selection opens one window with all files. Associations for `.zip`, `.7z`, `.tar` and others are switched on and rolled back in Settings; no administrator rights needed.
+- **Explorer.** A "Packrat" menu for archives (open, extract here, extract to folder, test) and for any file (add to `.zip`, `.7z`, `.tar.zst`, custom name). A multi-selection (files or archives) opens one window: files go into one archive, archives are extracted one after another with a single summary. “Send to” → “Packrat — to archive” does the same. On Windows 11 the menu is under “Show more options”; Settings has a switch for the classic menu (undone by unticking, Explorer must restart). Associations for `.zip`, `.7z`, `.tar` and others are switched on and rolled back in Settings; no administrator rights needed.
 - **Verify and repair.** "Test integrity" (CRC and SHA-256), `packrat-cli test`. A damaged or truncated ZIP is read from its local headers (`extract --repair`); partly extracted files are kept. On "access denied" you can retry as administrator.
 - **Preview without extracting.** Select a file and its content appears on the right: images (PNG, JPEG, GIF, BMP,
   WebP) as a thumbnail with a full-size view, text and code with syntax highlighting, a hex view for the rest. For

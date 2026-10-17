@@ -47,6 +47,8 @@ impl App {
             smart: self.settings.smart_default,
             selected_only: selected_only && selected_count > 0,
             selected_count,
+            open_after: self.settings.open_after_extract,
+            delete_after: self.settings.delete_after_extract,
         });
     }
 
@@ -154,6 +156,9 @@ impl App {
         match report {
             Err(e) => {
                 diag::error(&format!("extract failed: {e}"));
+                if let Some(q) = self.queue.as_mut() {
+                    q.record_extract(false, dest, None);
+                }
                 self.result = Some(ResultInfo {
                     ok: false,
                     lines: vec![tf(Key::ErrorGeneric, &[&e])],
@@ -171,6 +176,9 @@ impl App {
                     r.skipped_existing.len(),
                     r.cancelled
                 ));
+                let clean = r.blocked.is_empty() && r.failed.is_empty() && !r.cancelled && r.stopped.is_none();
+                // skipped files mean that not everything came out
+                let complete = clean && r.skipped_existing.is_empty();
                 let mut lines = Vec::new();
                 if r.cancelled {
                     lines.push(t(Key::Cancelled).to_owned());
@@ -194,6 +202,9 @@ impl App {
                 if let Some(m) = &r.stopped {
                     lines.push(tf(Key::StoppedByLimit, &[m]));
                 }
+                if complete && self.settings.delete_after_extract && !self.repair_mode {
+                    lines.extend(self.recycle_extracted_archive());
+                }
                 let mut details = Vec::new();
                 details.extend(r.blocked.iter().map(|i| format!("⛔ {} — {}", i.path, i.message)));
                 details.extend(r.failed.iter().map(|i| format!("✖ {} — {}", i.path, i.message)));
@@ -204,17 +215,41 @@ impl App {
                     .failed
                     .iter()
                     .any(|i| i.message.contains("wrong password") || i.message.contains("password"));
-                self.result = Some(ResultInfo {
-                    ok: r.blocked.is_empty() && r.failed.is_empty() && !r.cancelled && r.stopped.is_none(),
+                let info = ResultInfo {
+                    ok: clean,
                     lines,
                     details,
-                    folder: Some(dest),
+                    folder: Some(dest.clone()),
                     wrong_password,
                     admin,
                     ..Default::default()
-                });
+                };
+                match self.queue.as_mut() {
+                    Some(q) if complete => q.record_extract(true, dest, Some(info)),
+                    Some(q) => {
+                        q.record_extract(false, dest, None);
+                        self.result = Some(info);
+                    }
+                    None => self.result = Some(info),
+                }
             }
         }
+    }
+
+    /// Moves the archive that was just extracted completely to the Recycle Bin; returns what to tell the user.
+    fn recycle_extracted_archive(&mut self) -> Option<String> {
+        let job = self.last_extract.as_ref().filter(|j| j.entries.is_none())?;
+        let path = job.archive.clone();
+        // the open archive would keep the file locked
+        self.loaded = None;
+        self.preview.clear();
+        Some(match winint::recycle(&path) {
+            Ok(()) => t(Key::ArchiveDeleted).to_owned(),
+            Err(e) => {
+                diag::warn(&format!("cannot recycle the archive: {e}"));
+                tf(Key::ArchiveNotDeleted, &[&e])
+            }
+        })
     }
 
     pub(super) fn begin_create(&mut self, items: Vec<PathBuf>) {
@@ -378,6 +413,8 @@ impl App {
                 }
             });
             ui.checkbox(&mut d.smart, t(Key::SmartExtract));
+            ui.checkbox(&mut d.open_after, t(Key::SettingOpenAfter));
+            ui.checkbox(&mut d.delete_after, t(Key::SettingDeleteAfter));
             if d.selected_count > 0 {
                 ui.radio_value(
                     &mut d.selected_only,
@@ -400,7 +437,11 @@ impl App {
         });
         if go {
             let (dest, smart, only) = (PathBuf::from(d.dest.trim()), d.smart, d.selected_only);
+            (self.settings.open_after_extract, self.settings.delete_after_extract) = (d.open_after, d.delete_after);
             self.extract = None;
+            if let Some(q) = self.queue.as_mut() {
+                q.remember_dest(dest.clone(), smart);
+            }
             self.start_extract(ctx, dest, smart, only);
         } else if close {
             self.extract = None;
@@ -635,6 +676,9 @@ impl App {
             self.ask_password_for_open_archive();
         } else if close {
             self.result = None;
+            if self.quit_on_close {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
     }
 
@@ -654,6 +698,10 @@ impl App {
         let mut explorer_menu: Option<bool> = None;
         let mut assoc: Option<bool> = None;
         let mut open_default_apps = false;
+        let win11 = shell::is_windows11();
+        let classic_menu = shell::classic_menu_enabled(&env);
+        let mut classic: Option<bool> = None;
+        let mut restart_explorer = false;
         egui::Window::new(RichText::new(t(Key::SettingsTitle)).strong())
             .open(&mut open)
             .collapsible(false)
@@ -695,6 +743,12 @@ impl App {
                         .changed();
                 });
                 changed |= ui.checkbox(&mut s.smart_default, t(Key::SettingSmartDefault)).changed();
+                changed |= ui
+                    .checkbox(&mut s.open_after_extract, t(Key::SettingOpenAfter))
+                    .changed();
+                changed |= ui
+                    .checkbox(&mut s.delete_after_extract, t(Key::SettingDeleteAfter))
+                    .changed();
                 changed |= ui.checkbox(&mut s.check_updates, t(Key::SettingCheckUpdates)).changed();
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
@@ -712,6 +766,16 @@ impl App {
                     explorer_menu = Some(menu_on);
                 }
                 ui.label(theme::dim(t(Key::ExplorerMenuHint)));
+                if win11 {
+                    let mut on = classic_menu;
+                    if ui.checkbox(&mut on, t(Key::ClassicMenu)).changed() {
+                        classic = Some(on);
+                    }
+                    ui.label(theme::dim(t(Key::ClassicMenuHint)));
+                    if ui.button(t(Key::RestartExplorer)).clicked() {
+                        restart_explorer = true;
+                    }
+                }
                 ui.horizontal(|ui| {
                     if ui.button(t(Key::AssocSet)).clicked() {
                         assoc = Some(true);
@@ -787,6 +851,15 @@ impl App {
                     note = Some(tf(Key::ErrorGeneric, &[&e]));
                 }
             }
+        }
+        if let Some(on) = classic
+            && !self.demo
+            && let Err(e) = shell::set_classic_menu(&env, on)
+        {
+            note = Some(tf(Key::ErrorGeneric, &[&e]));
+        }
+        if restart_explorer && !self.demo {
+            winint::restart_explorer();
         }
         if open_default_apps {
             let _ = std::process::Command::new("cmd")

@@ -70,24 +70,28 @@ fn main() -> ExitCode {
     }
     let parsed = args::parse(&args);
     // Explorer starts one process per selected file: the first one collects the others and acts for all
+    let together = parsed.together;
     let action = match parsed.action {
-        gui::StartAction::Add(items) => {
-            match batch::gather(&dragout::temp_root(), "add", items[0].clone(), batch::SETTLE) {
-                Some(all) => gui::StartAction::Add(all),
-                None => return ExitCode::SUCCESS,
-            }
-        }
-        gui::StartAction::Quick { format, items } => {
-            match batch::gather(
-                &dragout::temp_root(),
-                &format!("quick-{format}"),
-                items[0].clone(),
-                batch::SETTLE,
-            ) {
-                Some(all) => gui::StartAction::Quick { format, items: all },
-                None => return ExitCode::SUCCESS,
-            }
-        }
+        gui::StartAction::Add(items) if !together => match gather("add", &items) {
+            Some(all) => gui::StartAction::Add(all),
+            None => return ExitCode::SUCCESS,
+        },
+        gui::StartAction::Quick { format, items } => match gather(&format!("quick-{format}"), &items) {
+            Some(all) => gui::StartAction::Quick { format, items: all },
+            None => return ExitCode::SUCCESS,
+        },
+        gui::StartAction::ExtractHere(items) => match gather("extract-here", &items) {
+            Some(all) => gui::StartAction::ExtractHere(all),
+            None => return ExitCode::SUCCESS,
+        },
+        gui::StartAction::ExtractTo(items) => match gather("extract-to", &items) {
+            Some(all) => gui::StartAction::ExtractTo(all),
+            None => return ExitCode::SUCCESS,
+        },
+        gui::StartAction::Test(items) => match gather("test", &items) {
+            Some(all) => gui::StartAction::Test(all),
+            None => return ExitCode::SUCCESS,
+        },
         other => other,
     };
     let opts = gui::StartOptions {
@@ -106,6 +110,11 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Explorer starts one process per selected file: the first one collects the others (`None` in all the rest).
+fn gather(kind: &str, items: &[std::path::PathBuf]) -> Option<Vec<std::path::PathBuf>> {
+    batch::gather(&dragout::temp_root(), kind, items[0].clone(), batch::SETTLE)
 }
 
 fn run_install(exe: &std::path::Path, silent: bool) -> ExitCode {

@@ -13,6 +13,8 @@ pub const EXE_NAME: &str = "Packrat.exe";
 pub struct Env {
     pub install_dir: PathBuf,
     pub start_menu_dir: PathBuf,
+    /// The "Send to" folder of the user.
+    pub sendto_dir: PathBuf,
     /// Registry path below HKCU that holds `Microsoft\Windows\CurrentVersion\Uninstall` (normally `Software`).
     pub software_key: String,
 }
@@ -26,6 +28,7 @@ impl Env {
             return Env {
                 install_dir: root.join("Programs").join(APP_NAME),
                 start_menu_dir: root.join("StartMenu"),
+                sendto_dir: root.join("SendTo"),
                 software_key: r"Software\PackratSandbox".into(),
             };
         }
@@ -38,6 +41,7 @@ impl Env {
         Env {
             install_dir: local.join("Programs").join(APP_NAME),
             start_menu_dir: roaming.join(r"Microsoft\Windows\Start Menu\Programs"),
+            sendto_dir: roaming.join(r"Microsoft\Windows\SendTo"),
             software_key: "Software".into(),
         }
     }
@@ -189,6 +193,7 @@ mod tests {
         let env = Env {
             install_dir: dir.path().join("Programs").join("Packrat"),
             start_menu_dir: dir.path().join("StartMenu"),
+            sendto_dir: dir.path().join("SendTo"),
             software_key: format!(r"Software\PackratTest-{}", std::process::id()),
         };
         let fake_exe = dir.path().join("Packrat-Setup.exe");
@@ -201,6 +206,10 @@ mod tests {
         // the shell may report the 8.3 short form of the temp folder: compare real paths
         assert_eq!(fs::canonicalize(target).unwrap(), fs::canonicalize(&installed).unwrap());
         assert!(registry_has(&env));
+        assert!(
+            crate::shell::sendto_links(&env).iter().any(|l| l.exists()),
+            "Send to entry"
+        );
 
         // installing again over an existing copy works (upgrade)
         fs::write(&fake_exe, b"MZ newer").unwrap();
@@ -209,6 +218,7 @@ mod tests {
 
         uninstall(&env, None).unwrap();
         assert!(!env.install_dir.exists() && !env.shortcut().exists() && !registry_has(&env));
+        assert!(crate::shell::sendto_links(&env).iter().all(|l| !l.exists()));
 
         // clean the sandbox registry root
         use winreg::RegKey;

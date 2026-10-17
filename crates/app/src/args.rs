@@ -8,6 +8,8 @@ pub struct Parsed {
     pub action: StartAction,
     pub demo: bool,
     pub screenshots: Option<PathBuf>,
+    /// The paths arrived together in one start (no need to wait for sibling processes of one selection).
+    pub together: bool,
 }
 
 /// Flags that take a value and are handled elsewhere (their value must not be mistaken for an archive).
@@ -19,6 +21,7 @@ pub fn parse(args: &[String]) -> Parsed {
         action: StartAction::None,
         demo: false,
         screenshots: None,
+        together: false,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -28,22 +31,30 @@ pub fn parse(args: &[String]) -> Parsed {
             "--screenshots" => p.screenshots = value(),
             "--extract-here" => {
                 if let Some(v) = value() {
-                    p.action = StartAction::ExtractHere(v);
+                    p.action = StartAction::ExtractHere(vec![v]);
                 }
             }
             "--extract-to" => {
                 if let Some(v) = value() {
-                    p.action = StartAction::ExtractTo(v);
+                    p.action = StartAction::ExtractTo(vec![v]);
                 }
             }
             "--test" => {
                 if let Some(v) = value() {
-                    p.action = StartAction::Test(v);
+                    p.action = StartAction::Test(vec![v]);
                 }
             }
             "--add" => {
                 if let Some(v) = value() {
                     p.action = StartAction::Add(vec![v]);
+                }
+            }
+            "--add-all" => {
+                // "Send to" hands over every selected path in this one start
+                let items: Vec<PathBuf> = it.by_ref().map(PathBuf::from).collect();
+                if !items.is_empty() {
+                    p.action = StartAction::Add(items);
+                    p.together = true;
                 }
             }
             "--quick" => {
@@ -67,7 +78,6 @@ pub fn parse(args: &[String]) -> Parsed {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
@@ -83,7 +93,7 @@ mod tests {
     #[test]
     fn explorer_actions_carry_their_path() {
         assert!(
-            matches!(parse(&args(&["--extract-here", r"C:\a b.zip"])).action, StartAction::ExtractHere(p) if p == Path::new(r"C:\a b.zip"))
+            matches!(parse(&args(&["--extract-here", r"C:\a b.zip"])).action, StartAction::ExtractHere(p) if p == [PathBuf::from(r"C:\a b.zip")])
         );
         assert!(matches!(
             parse(&args(&["--extract-to", "x.zip"])).action,
@@ -94,6 +104,9 @@ mod tests {
             StartAction::Test(_)
         ));
         assert!(matches!(parse(&args(&["--add", "f.txt"])).action, StartAction::Add(v) if v.len() == 1));
+        let sent = parse(&args(&["--add-all", r"C:.txt", r"C: c.txt", r"C:\dir"]));
+        assert!(sent.together && matches!(sent.action, StartAction::Add(v) if v.len() == 3));
+        assert!(matches!(parse(&args(&["--add-all"])).action, StartAction::None));
         match parse(&args(&["--quick", "tar.zst", r"C:\data"])).action {
             StartAction::Quick { format, items } => {
                 assert_eq!(format, "tar.zst");

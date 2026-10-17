@@ -3,6 +3,10 @@ use std::path::PathBuf;
 
 /// `%APPDATA%\Packrat` (or `PACKRAT_DATA_DIR`, which tests and portable setups can use).
 pub fn data_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(d) = PRIVATE_DATA_DIR.with(|p| p.borrow().clone()) {
+        return d;
+    }
     if let Some(d) = std::env::var_os("PACKRAT_DATA_DIR") {
         return PathBuf::from(d);
     }
@@ -29,6 +33,10 @@ pub struct Settings {
     pub default_format: String,
     pub level: u32,
     pub last_dest: Option<String>,
+    /// Open the folder when an extraction ends cleanly.
+    pub open_after_extract: bool,
+    /// Move the archive to the Recycle Bin after a clean extraction of all of it.
+    pub delete_after_extract: bool,
 }
 
 impl Default for Settings {
@@ -43,6 +51,8 @@ impl Default for Settings {
             default_format: "zip".into(),
             level: 6,
             last_dest: None,
+            open_after_extract: true,
+            delete_after_extract: false,
         }
     }
 }
@@ -71,6 +81,19 @@ impl Settings {
         self.recent.insert(0, archive.to_owned());
         self.recent.truncate(10);
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PRIVATE_DATA_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Gives the calling test thread a data folder of its own, for tests that change and save settings.
+#[cfg(test)]
+pub fn use_private_test_data_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("temp dir");
+    PRIVATE_DATA_DIR.with(|p| *p.borrow_mut() = Some(dir.path().to_path_buf()));
+    dir
 }
 
 /// Points `PACKRAT_DATA_DIR` at one temp folder shared by all tests of this binary.

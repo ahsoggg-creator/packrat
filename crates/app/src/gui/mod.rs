@@ -4,6 +4,7 @@ mod actions;
 mod dialogs;
 mod jobs;
 mod preview;
+mod queue;
 mod secure;
 mod shots;
 pub mod theme;
@@ -30,9 +31,9 @@ use tree::Sort;
 /// What the program was asked to do right after it starts (the Explorer menu launches these).
 pub enum StartAction {
     None,
-    ExtractHere(PathBuf),
-    ExtractTo(PathBuf),
-    Test(PathBuf),
+    ExtractHere(Vec<PathBuf>),
+    ExtractTo(Vec<PathBuf>),
+    Test(Vec<PathBuf>),
     Add(Vec<PathBuf>),
     Quick {
         format: String,
@@ -56,6 +57,7 @@ pub fn run(opts: StartOptions) -> eframe::Result {
         height: 64,
     };
     let shots = opts.screenshots.is_some();
+    let quiet = is_quiet(&opts);
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Packrat")
         .with_inner_size([1100.0, 700.0])
@@ -64,6 +66,12 @@ pub fn run(opts: StartOptions) -> eframe::Result {
         .with_drag_and_drop(true);
     if shots {
         viewport = viewport.with_resizable(false);
+    }
+    if quiet {
+        // an extraction started from Explorer needs a progress bar, not the whole archive window
+        viewport = viewport
+            .with_inner_size([600.0, 280.0])
+            .with_min_inner_size([520.0, 220.0]);
     }
     let options = eframe::NativeOptions {
         viewport,
@@ -80,9 +88,18 @@ pub fn run(opts: StartOptions) -> eframe::Result {
     )
 }
 
+/// Extractions started from the Explorer menu get a compact window that closes by itself.
+fn is_quiet(opts: &StartOptions) -> bool {
+    !opts.demo
+        && opts.screenshots.is_none()
+        && matches!(opts.action, StartAction::ExtractHere(_) | StartAction::ExtractTo(_))
+}
+
 pub(crate) struct ExtractDialog {
     pub dest: String,
     pub smart: bool,
+    pub open_after: bool,
+    pub delete_after: bool,
     pub selected_only: bool,
     pub selected_count: usize,
 }
@@ -207,6 +224,12 @@ pub(crate) struct App {
     pub crash_note: Option<String>,
     pub shots: Option<shots::Runner>,
     pub logo: Option<egui::TextureHandle>,
+    /// Archives from one Explorer selection, handled in turn.
+    pub queue: Option<queue::Queue>,
+    /// The window only exists for the queue: it closes together with the last dialog.
+    pub quit_on_close: bool,
+    /// Compact window of an Explorer extraction.
+    pub quiet: bool,
 }
 
 impl App {
@@ -227,6 +250,7 @@ impl App {
                     .unwrap_or_default()
             })
         });
+        let quiet = is_quiet(&opts);
         let mut app = App {
             settings,
             loaded: None,
@@ -257,6 +281,9 @@ impl App {
             crash_note,
             shots: opts.screenshots.map(shots::Runner::new),
             logo: load_logo(ctx),
+            queue: None,
+            quit_on_close: false,
+            quiet,
         };
         if app.demo {
             app.settings.recent = crate::demo::recent_files();
@@ -277,23 +304,9 @@ impl App {
     fn run_action(&mut self, ctx: &egui::Context, action: StartAction) {
         match action {
             StartAction::None => {}
-            StartAction::ExtractHere(p) => {
-                let dest = p.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
-                self.after_open = AfterOpen::Extract {
-                    dest,
-                    smart: true,
-                    selected_only: false,
-                };
-                self.open_path(ctx, p);
-            }
-            StartAction::ExtractTo(p) => {
-                self.after_open = AfterOpen::ExtractDialog;
-                self.open_path(ctx, p);
-            }
-            StartAction::Test(p) => {
-                self.after_open = AfterOpen::Verify;
-                self.open_path(ctx, p);
-            }
+            StartAction::ExtractHere(items) => self.start_queue(ctx, queue::QueueKind::Here, items, self.quiet),
+            StartAction::ExtractTo(items) => self.start_queue(ctx, queue::QueueKind::To, items, self.quiet),
+            StartAction::Test(items) => self.start_queue(ctx, queue::QueueKind::Test, items, false),
             StartAction::Add(items) => self.begin_create(items),
             StartAction::Quick { format, items } => self.quick_create(ctx, &format, items),
             StartAction::Elevated(job_file) => self.start_elevated(ctx, &job_file),
@@ -534,6 +547,30 @@ impl App {
         }
     }
 
+    /// What the compact window of an Explorer extraction shows behind its dialogs.
+    fn compact_view(&mut self, ui: &mut Ui) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::PALETTE.bg).inner_margin(16.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if let Some(logo) = &self.logo {
+                        ui.image((logo.id(), egui::vec2(28.0, 28.0)));
+                    }
+                    ui.label(egui::RichText::new("Packrat").strong().size(18.0));
+                });
+                if let Some(q) = &self.queue {
+                    ui.add_space(8.0);
+                    if q.total() > 1 {
+                        ui.label(tf(
+                            Key::BatchTitle,
+                            &[&q.position().to_string(), &q.total().to_string()],
+                        ));
+                    }
+                    ui.add(egui::Label::new(theme::dim(q.current_name())).truncate());
+                }
+            });
+    }
+
     pub fn show_toast(&mut self, text: String) {
         self.toast = Some((text, std::time::Instant::now()));
     }
@@ -559,6 +596,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_job(&ctx);
+        self.advance_queue(&ctx);
         self.poll_update(&ctx);
         self.handle_drops(&ctx);
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) && self.job.is_none() {
@@ -568,19 +606,23 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
-        self.top_bar(ui);
-        self.status_bar(ui);
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::PALETTE.bg))
-            .show(ui, |ui| {
-                ui.add_enabled_ui(self.job.is_none(), |ui| {
-                    if self.loaded.is_some() {
-                        self.archive_view(ui);
-                    } else {
-                        self.welcome_view(ui);
-                    }
+        if self.quiet {
+            self.compact_view(ui);
+        } else {
+            self.top_bar(ui);
+            self.status_bar(ui);
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(theme::PALETTE.bg))
+                .show(ui, |ui| {
+                    ui.add_enabled_ui(self.job.is_none(), |ui| {
+                        if self.loaded.is_some() {
+                            self.archive_view(ui);
+                        } else {
+                            self.welcome_view(ui);
+                        }
+                    });
                 });
-            });
+        }
 
         self.pump_preview(&ctx);
         self.dialogs(&ctx);
@@ -971,7 +1013,7 @@ mod tests {
                 open: vec![],
                 demo: false,
                 screenshots: None,
-                action: StartAction::ExtractHere(archive.clone()),
+                action: StartAction::ExtractHere(vec![archive.clone()]),
             },
         );
         for _ in 0..3 {
@@ -990,7 +1032,7 @@ mod tests {
                 open: vec![],
                 demo: false,
                 screenshots: None,
-                action: StartAction::Test(archive.clone()),
+                action: StartAction::Test(vec![archive.clone()]),
             },
         );
         for _ in 0..2 {
@@ -1014,6 +1056,179 @@ mod tests {
             },
         );
         assert_eq!(app.create.as_ref().unwrap().items.len(), 1);
+    }
+
+    /// Several archives from one Explorer selection; `set` tunes the settings before anything starts.
+    fn run_queue(
+        action: StartAction,
+        set: impl FnOnce(&mut Settings),
+        on_problem: &mut dyn FnMut(&mut App),
+    ) -> (App, egui::Context, tempfile::TempDir) {
+        let data = crate::settings::use_private_test_data_dir();
+        let ctx = egui::Context::default();
+        let mut app = App::new(
+            &ctx,
+            StartOptions {
+                open: vec![],
+                demo: false,
+                screenshots: None,
+                action,
+            },
+        );
+        set(&mut app.settings);
+        for _ in 0..4000 {
+            app.poll_job(&ctx);
+            if let Some(c) = app.conflicts.take() {
+                // a file is in the way: keep the existing one
+                let mut opts = c.opts;
+                opts.default_resolution = Resolution::Skip;
+                app.run_execute(&ctx, *c.plan, *opts);
+            }
+            if app.job.is_none() && app.result.is_some() && app.queue.is_some() {
+                on_problem(&mut app);
+            }
+            app.advance_queue(&ctx);
+            if app.queue.is_none() {
+                return (app, ctx, data);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("the queue did not finish");
+    }
+
+    fn zip_with(dir: &std::path::Path, name: &str, file: &str, text: &str) -> PathBuf {
+        let src = dir.join(format!("{name}-src"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join(file), text).unwrap();
+        let archive = dir.join(format!("{name}.zip"));
+        create_archive(
+            &archive,
+            &[src.join(file)],
+            &CreateOptions::new(Format::Zip(ZipMethod::Deflate)),
+            &packrat_core::Progress::new(),
+        )
+        .unwrap();
+        archive
+    }
+
+    #[test]
+    fn a_selection_of_archives_is_extracted_in_one_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let archives: Vec<PathBuf> = (0..3)
+            .map(|i| zip_with(dir.path(), &format!("a{i}"), &format!("f{i}.txt"), &format!("body {i}")))
+            .collect();
+        let (app, ..) = run_queue(
+            StartAction::ExtractHere(archives),
+            |s| s.open_after_extract = false,
+            &mut |_| panic!("no problems expected"),
+        );
+        for i in 0..3 {
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(format!("f{i}.txt"))).unwrap(),
+                format!("body {i}")
+            );
+        }
+        let r = app.result.as_ref().expect("one summary at the end");
+        assert!(r.ok && r.lines[0].contains('3'), "{:?}", r.lines);
+        assert!(app.quit_on_close, "an Explorer run closes the window after the summary");
+    }
+
+    #[test]
+    fn a_bad_archive_does_not_stop_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = zip_with(dir.path(), "good", "g.txt", "fine");
+        let bad = dir.path().join("bad.zip");
+        std::fs::write(&bad, b"this is not an archive").unwrap();
+        let mut seen = 0;
+        let (app, ..) = run_queue(
+            StartAction::ExtractHere(vec![bad, good]),
+            |s| s.open_after_extract = false,
+            &mut |app| {
+                seen += 1;
+                app.result = None;
+            },
+        );
+        assert_eq!(seen, 1, "the unreadable archive is reported once");
+        assert_eq!(std::fs::read_to_string(dir.path().join("g.txt")).unwrap(), "fine");
+        let r = app.result.as_ref().expect("summary");
+        assert!(
+            !r.ok && r.details.iter().any(|d| d.contains("bad.zip")),
+            "{:?}",
+            r.details
+        );
+    }
+
+    #[test]
+    fn archives_go_to_the_folder_chosen_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let archives = vec![
+            zip_with(dir.path(), "one", "1.txt", "1"),
+            zip_with(dir.path(), "two", "2.txt", "2"),
+        ];
+        let out = dir.path().join("out");
+        let ctx = egui::Context::default();
+        let _data = crate::settings::use_private_test_data_dir();
+        let mut app = App::new(
+            &ctx,
+            StartOptions {
+                open: vec![],
+                demo: false,
+                screenshots: None,
+                action: StartAction::ExtractTo(archives),
+            },
+        );
+        app.settings.open_after_extract = false;
+        for _ in 0..4000 {
+            app.poll_job(&ctx);
+            if let Some(d) = app.extract.as_mut() {
+                // the dialog appears for the first archive only
+                d.dest = out.to_string_lossy().into_owned();
+                let (dest, smart) = (PathBuf::from(&d.dest), d.smart);
+                app.extract = None;
+                app.queue.as_mut().unwrap().remember_dest(dest.clone(), smart);
+                app.start_extract(&ctx, dest, smart, false);
+            }
+            app.advance_queue(&ctx);
+            if app.queue.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.queue.is_none(), "the queue finished");
+        assert_eq!(std::fs::read_to_string(out.join("1.txt")).unwrap(), "1");
+        assert_eq!(std::fs::read_to_string(out.join("2.txt")).unwrap(), "2");
+    }
+
+    #[test]
+    fn a_clean_extraction_can_move_the_archive_to_the_recycle_bin() {
+        let dir = tempfile::tempdir().unwrap();
+        let keep = zip_with(dir.path(), "keep", "k.txt", "stay");
+        let gone = zip_with(dir.path(), "gone", "g.txt", "go");
+        let (..) = run_queue(
+            StartAction::ExtractHere(vec![gone.clone()]),
+            |s| {
+                s.open_after_extract = false;
+                s.delete_after_extract = true;
+            },
+            &mut |_| {},
+        );
+        assert_eq!(std::fs::read_to_string(dir.path().join("g.txt")).unwrap(), "go");
+        assert!(!gone.exists(), "the extracted archive is gone");
+        assert!(keep.exists());
+
+        // a partial result must keep the archive: the existing file is skipped
+        std::fs::write(dir.path().join("k.txt"), "stay").unwrap();
+        let again = zip_with(dir.path(), "again", "k.txt", "other");
+        let (..) = run_queue(
+            StartAction::ExtractHere(vec![again.clone()]),
+            |s| {
+                s.open_after_extract = false;
+                s.delete_after_extract = true;
+            },
+            &mut |app| app.result = None,
+        );
+        assert!(again.exists(), "nothing is deleted when files were skipped");
+        assert_eq!(std::fs::read_to_string(dir.path().join("k.txt")).unwrap(), "stay");
     }
 
     #[test]

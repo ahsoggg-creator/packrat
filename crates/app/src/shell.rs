@@ -3,7 +3,9 @@
 //! * the cascading "Packrat" context menu: on archives (extract smart / extract to… / test / open) and on every
 //!   other file and folder (add to archive…, quick .zip / .7z / .tar.zst). It lives in the classic menu; on
 //!   Windows 11 that is "Show more options" (Shift+F10).
+//! * a "Send to" entry that adds all selected files to one archive in a single start.
 //! * optional file associations with a recorded backup, so they can be undone exactly.
+//! * an optional switch to the classic context menu on Windows 11, where the menu above is visible at once.
 //!
 //! Every location is derived from `Env`, so tests run against a throw-away registry branch.
 
@@ -45,6 +47,17 @@ const ARCHIVE_ITEMS: [Item; 4] = [
     ("30test", i18n::Key::MenuTest, "--test \"%1\""),
     ("40open", i18n::Key::MenuOpen, "\"%1\""),
 ];
+
+/// The class Windows 11 asks for the new context menu; an empty in-process server makes it fall back to the classic one.
+const CLASSIC_MENU_CLSID: &str = "{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}";
+
+/// Both language variants of the "Send to" link, so a language change leaves no stale entry.
+pub fn sendto_links(env: &Env) -> Vec<PathBuf> {
+    [i18n::Lang::Ru, i18n::Lang::En]
+        .into_iter()
+        .map(|l| env.sendto_dir.join(format!("{}.lnk", i18n::Key::SendToName.text(l))))
+        .collect()
+}
 
 const ADD_ITEMS: [Item; 4] = [
     ("10add", i18n::Key::MenuAdd, "--add \"%1\""),
@@ -124,11 +137,59 @@ mod imp {
                 lang,
             )?;
         }
+        if let Err(e) = register_sendto(env, exe, lang) {
+            crate::diag::warn(&format!("cannot add the Send to entry: {e}"));
+        }
         notify(env);
         Ok(())
     }
 
+    fn register_sendto(env: &Env, exe: &Path, lang: i18n::Lang) -> Result<(), String> {
+        remove_sendto(env);
+        let lnk = env.sendto_dir.join(format!("{}.lnk", i18n::Key::SendToName.text(lang)));
+        crate::winint::create_shortcut(&lnk, exe, "--add-all", "Packrat")
+    }
+
+    fn remove_sendto(env: &Env) {
+        for l in sendto_links(env) {
+            let _ = std::fs::remove_file(l);
+        }
+    }
+
+    pub fn classic_menu_enabled(env: &Env) -> bool {
+        hkcu()
+            .open_subkey(format!(r"{}\CLSID\{CLASSIC_MENU_CLSID}\InprocServer32", classes(env)))
+            .is_ok()
+    }
+
+    pub fn set_classic_menu(env: &Env, on: bool) -> Result<(), String> {
+        let path = format!(r"{}\CLSID\{CLASSIC_MENU_CLSID}", classes(env));
+        if on {
+            let (key, _) = hkcu()
+                .create_subkey(format!(r"{path}\InprocServer32"))
+                .map_err(|e| e.to_string())?;
+            key.set_value("", &"").map_err(|e| e.to_string())
+        } else {
+            match hkcu().delete_subkey_all(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    /// The new context menu exists from build 22000 on.
+    pub fn is_windows11() -> bool {
+        use winreg::enums::HKEY_LOCAL_MACHINE;
+        RegKey::predef(HKEY_LOCAL_MACHINE)
+            .open_subkey(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion")
+            .and_then(|k| k.get_value::<String, _>("CurrentBuildNumber"))
+            .ok()
+            .and_then(|b| b.parse::<u32>().ok())
+            .is_some_and(|b| b >= 22000)
+    }
+
     pub fn unregister(env: &Env) {
+        remove_sendto(env);
         let base = classes(env);
         let mut paths = vec![
             format!(r"{base}\*\shell\{MENU_KEY}"),
@@ -311,6 +372,18 @@ mod imp {
     pub fn associated_exts(_: &Env) -> Vec<String> {
         Vec::new()
     }
+
+    pub fn classic_menu_enabled(_: &Env) -> bool {
+        false
+    }
+
+    pub fn set_classic_menu(_: &Env, _: bool) -> Result<(), String> {
+        Err("the context menu needs Windows".into())
+    }
+
+    pub fn is_windows11() -> bool {
+        false
+    }
 }
 
 /// Installs the context menu (labels in `lang`).
@@ -340,6 +413,20 @@ pub fn associated_exts(env: &Env) -> Vec<String> {
     imp::associated_exts(env)
 }
 
+/// Whether Windows 11 shows the classic context menu (and so the Packrat entries) at once.
+pub fn classic_menu_enabled(env: &Env) -> bool {
+    imp::classic_menu_enabled(env)
+}
+
+/// Switches the Windows 11 context menu to the classic one and back. Explorer picks it up after a restart.
+pub fn set_classic_menu(env: &Env, on: bool) -> Result<(), String> {
+    imp::set_classic_menu(env, on)
+}
+
+pub fn is_windows11() -> bool {
+    imp::is_windows11()
+}
+
 /// Called by the installer: the menu is part of a normal install.
 pub fn register_if_enabled(env: &Env, exe: &Path) {
     let lang = i18n::lang();
@@ -359,6 +446,14 @@ mod tests {
         Env {
             install_dir: PathBuf::from(r"C:\nowhere"),
             start_menu_dir: PathBuf::from(r"C:\nowhere"),
+            sendto_dir: std::env::temp_dir().join(
+                format!(
+                    "PackratSendToTest-{}-{:?}",
+                    std::process::id(),
+                    std::thread::current().id()
+                )
+                .replace(['(', ')'], ""),
+            ),
             software_key: format!(
                 r"Software\PackratShellTest-{}-{:?}",
                 std::process::id(),
@@ -369,6 +464,7 @@ mod tests {
     }
 
     fn cleanup(env: &Env) {
+        let _ = std::fs::remove_dir_all(&env.sendto_dir);
         let _ = RegKey::predef(HKEY_CURRENT_USER).delete_subkey_all(&env.software_key);
     }
 
@@ -418,8 +514,15 @@ mod tests {
         );
         assert!(value(&format!(r"{base}\Directory\shell\Packrat"), "AppliesTo").is_none());
 
+        // "Send to" adds everything it is given in one start
+        let en = env.sendto_dir.join("Packrat — to archive.lnk");
+        assert!(en.exists());
+        assert!(crate::winint::read_shortcut_target(&en).is_some());
+
         // labels follow the language chosen at registration
         register(&env, &exe, i18n::Lang::Ru).unwrap();
+        assert!(!en.exists(), "the entry of the other language is replaced");
+        assert!(env.sendto_dir.join("Packrat — в архив.lnk").exists());
         assert_eq!(
             value(
                 &format!(r"{base}\SystemFileAssociations\.zip\shell\Packrat\shell\30test"),
@@ -431,6 +534,7 @@ mod tests {
 
         unregister(&env);
         assert!(!is_registered(&env));
+        assert!(sendto_links(&env).iter().all(|l| !l.exists()));
         assert!(
             RegKey::predef(HKEY_CURRENT_USER)
                 .open_subkey(format!(r"{base}\SystemFileAssociations\.zip\shell\Packrat"))
@@ -474,6 +578,18 @@ mod tests {
         );
         assert!(hk.open_subkey(format!(r"{base}\{PROG_ID}")).is_err());
         assert!(associated_exts(&env).is_empty());
+        cleanup(&env);
+    }
+
+    #[test]
+    fn the_classic_menu_switch_is_written_and_removed() {
+        let env = sandbox();
+        assert!(!classic_menu_enabled(&env));
+        set_classic_menu(&env, true).unwrap();
+        assert!(classic_menu_enabled(&env));
+        set_classic_menu(&env, false).unwrap();
+        assert!(!classic_menu_enabled(&env));
+        set_classic_menu(&env, false).unwrap();
         cleanup(&env);
     }
 }
